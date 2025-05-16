@@ -1,0 +1,18 @@
+layer_config:
+  load_weights:
+    - image_encoder
+    - mask_downsample
+    - memory_attention
+    - memory_encoder
+    - sam_prompt_encoder
+    - sam_mask_decoder
+    - obj_ptr_proj
+    - obj_ptr_tpos_proj
+  freeze_layers:
+    - image_encoder
+    - mask_downsample
+    - memory_attention
+    - memory_encoder
+    - sam_prompt_encoder
+    - obj_ptr_proj
+    - obj_ptr_tpos_proj
