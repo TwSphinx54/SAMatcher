@@ -3,7 +3,7 @@ import torch
 import pprint
 import argparse
 import warnings
-import time
+import time # Ensure time is imported
 from pathlib import Path
 from src.build_model import ModelTrainer
 from src.build_samatcher import build_samatcher
@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore") # Suppress warnings
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    
+
     parser.add_argument('--data_cfg_path', type=str, default='config/train_config.py', help='Path to data configuration file.')
     parser.add_argument('--exp_name', type=str, default='SAMatcher', help='Experiment name, used for logging and output directories.')
     parser.add_argument('--output_dir', type=str, default='outputs', help='Directory to save checkpoints and logs.')
@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--save_every_n_epochs', type=int, default=5, help='Save checkpoint every N epochs.')
     parser.add_argument('--wandb_entity', type=str, default=None, help="Weights & Biases entity name (username or team name).")
     parser.add_argument('--wandb_project', type=str, default=None, help="Weights & Biases project name (overrides exp_name for W&B).")
-    
+
     parser.add_argument('--profiler_name', type=str, default=None, help='Profiler to use (e.g., "pytorch", "inference"). Leave None to disable.')
 
     # Add val_batch_size to args if not present, for MultiSceneDataModule
@@ -52,55 +52,63 @@ def parse_args():
 
 def main():
     args = parse_args()
-    
+
     # --- Initialize Accelerator and set seed ---
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         log_with=["wandb"],
-        project_dir=args.output_dir,
+        project_dir=args.output_dir, # Base directory for Accelerator's own logs if any
         mixed_precision=args.mixed_precision,
     )
     set_seed(args.seed)
 
     # --- Setup Logging ---
     # Configure loguru to use accelerator.print for distributed-friendly logging.
-    loguru_logger.remove() 
+    loguru_logger.remove()
     loguru_logger.add(lambda msg: accelerator.print(msg), format="{time} {level} {message}", level="INFO")
-    
+
+    # --- Create a run-specific output directory ---
+    current_time_str = time.strftime("%Y%m%d-%H%M%S")
+    run_specific_output_dir = Path(args.output_dir) / args.exp_name / current_time_str
+    if accelerator.is_main_process:
+        run_specific_output_dir.mkdir(parents=True, exist_ok=True)
+        loguru_logger.info(f"Run-specific output directory: {run_specific_output_dir}")
+
     # --- Initialize Weights & Biases (on main process only) ---
     if accelerator.is_main_process:
         wandb_project_name = args.wandb_project if args.wandb_project else args.exp_name
-        current_time_str = time.strftime("%Y%m%d-%H%M%S")
-        custom_run_name = f"{args.exp_name}_{current_time_str}" 
-        
+        # Reuse current_time_str for a consistent run identifier
+        custom_run_name = f"{args.exp_name}_{current_time_str}"
+
         init_kwargs = {"wandb": {"name": custom_run_name}}
         if args.wandb_entity:
             init_kwargs["wandb"]["entity"] = args.wandb_entity
-        
+
+        # Accelerator's project_dir is args.output_dir. W&B will create its own subfolder there.
         accelerator.init_trackers(project_name=wandb_project_name, config=vars(args), init_kwargs=init_kwargs)
         loguru_logger.info(f"Run arguments: {pprint.pformat(vars(args))}")
 
     # --- Load and adapt configuration ---
     config = get_cfg_defaults()
     config.merge_from_file(args.data_cfg_path)
-    
+
     # Adapt config based on Accelerate's distributed setup and runtime arguments
     config.TRAINER.WORLD_SIZE = accelerator.num_processes
     config.TRAINER.TRUE_BATCH_SIZE = config.TRAINER.WORLD_SIZE * args.batch_size * args.gradient_accumulation_steps
     config.TRAINER.TRUE_LR = args.true_lr
-    
+
     # Scaling logic is removed.
     # Initialize WARMUP_STEP.
     # If WARMUP_EPOCHS is set (>0) in config, WARMUP_STEP will be calculated after dataloader initialization.
     # Otherwise, WARMUP_STEP from config (e.g., default.py or train_config.py) will be used.
     if not (hasattr(config.TRAINER, 'WARMUP_STEP') and config.TRAINER.WARMUP_STEP > 0):
-        config.TRAINER.WARMUP_STEP = 0 
+        config.TRAINER.WARMUP_STEP = 0
 
     K_BEST_CHECKPOINTS = 5
-    top_k_checkpoints = [] 
+    top_k_checkpoints = []
 
     # Pass accelerator to allow DataModule to leverage its properties (e.g., for distributed sampling).
-    data_module = MultiSceneDataModule(args, config, accelerator) 
+    data_module = MultiSceneDataModule(args, config, accelerator)
     train_dataloader = data_module.train_dataloader()
     val_dataloader = data_module.val_dataloader() # Can be a single DataLoader or a list of DataLoaders
 
@@ -108,7 +116,7 @@ def main():
     if hasattr(config.TRAINER, 'WARMUP_EPOCHS') and config.TRAINER.WARMUP_EPOCHS > 0:
         if train_dataloader is not None and len(train_dataloader) > 0:
             steps_per_epoch = len(train_dataloader) // args.gradient_accumulation_steps
-            
+
             if steps_per_epoch == 0:
                 if accelerator.is_main_process:
                     loguru_logger.warning(
@@ -118,10 +126,10 @@ def main():
                         f"This can happen if the dataset size per process is smaller than gradient_accumulation_steps. "
                         f"Setting WARMUP_STEP to 0."
                     )
-                config.TRAINER.WARMUP_STEP = 0 
+                config.TRAINER.WARMUP_STEP = 0
             else:
                 config.TRAINER.WARMUP_STEP = math.floor(config.TRAINER.WARMUP_EPOCHS * steps_per_epoch)
-        else: 
+        else:
             if accelerator.is_main_process:
                 loguru_logger.warning(
                     "Train dataloader is None or empty. Cannot calculate WARMUP_STEP from WARMUP_EPOCHS. "
@@ -139,12 +147,28 @@ def main():
         loguru_logger.info(f"Final warmup optimizer steps: {config.TRAINER.WARMUP_STEP}")
 
     # --- Initialize Model, Optimizer, and Scheduler ---
-    profiler_output_path = Path(args.output_dir) / args.exp_name / "profiler"
+    profiler_output_path = run_specific_output_dir / "profiler" # Use run-specific dir
     profiler = build_profiler(args.profiler_name, accelerator, output_dir=profiler_output_path)
-    
+
+    visualization_dump_dir = run_specific_output_dir / "visualizations" # For local visualizations
+
     # ModelTrainer is a handler class that encapsulates the model and training/validation logic
     sam_model = build_samatcher(args.sam_cfg, args.sam_checkpoint)
-    model_handler = ModelTrainer(config, sam_model=sam_model, pretrained_ckpt=args.ckpt_path, profiler=profiler, accelerator=accelerator)
+
+    # Print trainable model parameters
+    loguru_logger.info("Trainable model parameters:")
+    for name, param in sam_model.named_parameters():
+        if param.requires_grad:
+            loguru_logger.info(f"  {name}")
+
+    model_handler = ModelTrainer(
+        config,
+        sam_model=sam_model,
+        pretrained_ckpt=args.ckpt_path,
+        profiler=profiler,
+        accelerator=accelerator,
+        dump_dir=str(visualization_dump_dir) # Pass the specific dump_dir
+    )
     model = model_handler.model
 
     # This section creates parameter groups for the optimizer, allowing different LRs for different parts of the model.
@@ -153,26 +177,26 @@ def main():
     new_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
-            if 'mask_decoder' in name: 
+            if 'mask_decoder' in name:
                 finetune_params.append(param)
             else:
                 new_params.append(param)
-    
+
     param_groups = []
     if finetune_params:
         param_groups.append({
-            'params': finetune_params, 
-            'lr': config.TRAINER.TRUE_LR * config.TRAINER.FT_LR_SCALE 
+            'params': finetune_params,
+            'lr': config.TRAINER.TRUE_LR * config.TRAINER.FT_LR_SCALE
         })
     if new_params:
         param_groups.append({
-            'params': new_params, 
+            'params': new_params,
             'lr': config.TRAINER.TRUE_LR
         })
 
     # If no specific parameter groups are defined, use all trainable parameters for the optimizer. Otherwise, use the defined groups.
     optimizer_params = param_groups if param_groups else filter(lambda p: p.requires_grad, model.parameters())
-        
+
     optimizer = build_optimizer(optimizer_params, config)
     scheduler = build_scheduler(config, optimizer) # Scheduler can be None if not configured
 
@@ -188,16 +212,16 @@ def main():
     for epoch in range(args.num_epochs):
         model.train()
         epoch_start_time = time.time()
-        
+
         if train_dataloader is None: # Ensure train_dataloader is available
             loguru_logger.error("Train dataloader is None. Skipping training epoch.")
-            break 
+            break
 
         for step, batch in enumerate(train_dataloader):
             if batch is None: # Handle cases where collate_fn_skip_none might return None
                 loguru_logger.warning(f"Skipping step {step} in epoch {epoch} due to empty batch after filtering.")
                 continue
-            
+
             # Learning rate warmup phase (applied per optimizer step)
             if config.TRAINER.WARMUP_STEP > 0 and total_steps < config.TRAINER.WARMUP_STEP:
                 if config.TRAINER.WARMUP_TYPE == 'linear':
@@ -209,13 +233,13 @@ def main():
                         target_lr_for_group = param_groups[pg_idx]['lr'] if param_groups else config.TRAINER.TRUE_LR
                         pg['lr'] = base_lr + current_lr_scale * abs(target_lr_for_group - base_lr)
                 # Add other warmup types (e.g., 'cosine') if necessary
-            
+
             # Forward and backward pass with gradient accumulation
             # accelerator.accumulate handles gradient synchronization and accumulation.
             with accelerator.accumulate(model):
                 # _trainval_inference performs forward pass, computes loss, and updates 'batch'
-                model_handler._trainval_inference(batch) 
-                loss = batch['loss'] 
+                model_handler._trainval_inference(batch)
+                loss = batch['loss']
                 loss_scalars = batch['loss_scalars']
 
                 accelerator.backward(loss)
@@ -224,7 +248,7 @@ def main():
                 if accelerator.sync_gradients:
                     if config.TRAINER.GRADIENT_CLIPPING > 0:
                         accelerator.clip_grad_norm_(model.parameters(), config.TRAINER.GRADIENT_CLIPPING)
-                    
+
                     optimizer.step()
                     optimizer.zero_grad()
                     total_steps += 1 # Increment total_steps only when optimizer.step() is called
@@ -239,7 +263,7 @@ def main():
                 log_dict = {"epoch": epoch, "step": total_steps, "train_loss": loss.item()}
                 for k, v in loss_scalars.items():
                     log_dict[f"train_{k}"] = v.item() if hasattr(v, 'item') else v
-                
+
                 # Log learning rates for all parameter groups
                 if optimizer and hasattr(optimizer, 'param_groups') and optimizer.param_groups:
                     for i, pg in enumerate(optimizer.param_groups):
@@ -252,16 +276,16 @@ def main():
                 remaining_steps_epoch = steps_in_epoch - (step + 1)
                 eta_epoch_seconds = remaining_steps_epoch * time_per_step_epoch
                 eta_epoch_str = time.strftime("%H:%M:%S", time.gmtime(eta_epoch_seconds))
-                
+
                 total_optimizer_steps_all_epochs = (len(train_dataloader) // args.gradient_accumulation_steps) * args.num_epochs
-                
+
                 # Prepare learning rate string for console logging
                 lr_info_parts = []
                 if optimizer and hasattr(optimizer, 'param_groups') and optimizer.param_groups:
                     for i, pg in enumerate(optimizer.param_groups):
                         lr_info_parts.append(f"LR_g{i}: {pg['lr']:.2e}")
                 lr_info_str = ", ".join(lr_info_parts) if lr_info_parts else "LR: N/A"
-                
+
                 loguru_logger.info(f"Epoch {epoch}, Step {total_steps}/{total_optimizer_steps_all_epochs}, Batch {step+1}/{steps_in_epoch}, ETA: {eta_epoch_str}, Loss: {loss.item():.4f}, {lr_info_str}")
 
         # End of epoch scheduler step (if configured)
@@ -272,11 +296,11 @@ def main():
         # --- Validation Phase ---
         if epoch % args.val_every_n_epochs == 0:
             model.eval()
-            all_val_loss_scalars_batches = [] 
-            all_val_metrics_batches = []      
-            
+            all_val_loss_scalars_batches = []
+            all_val_metrics_batches = []
+
             loguru_logger.info(f"Running validation for epoch {epoch}...")
-            
+
             if val_dataloader is None:
                 loguru_logger.warning("Val dataloader is None. Skipping validation phase.")
             else:
@@ -286,17 +310,17 @@ def main():
                     if current_val_loader is None:
                         loguru_logger.warning(f"Validation dataloader at index {val_loader_idx} is None. Skipping.")
                         continue
-                    
+
                     dataset_name_prefix = f"val_ds{val_loader_idx}_" if len(current_val_loaders) > 1 else "val_"
 
                     for val_step, val_batch in enumerate(current_val_loader):
-                        if val_batch is None: 
+                        if val_batch is None:
                             loguru_logger.warning(f"Skipping val_step {val_step} in val_loader {val_loader_idx} due to empty batch.")
                             continue
                         with torch.no_grad():
-                            model_handler._trainval_inference(val_batch) 
-                            metrics_output = model_handler._compute_metrics(val_batch) 
-                        
+                            model_handler._trainval_inference(val_batch)
+                            metrics_output = model_handler._compute_metrics(val_batch)
+
                         # The following explicit .to(accelerator.device) calls are defensive.
                         # If _trainval_inference and _compute_metrics always return tensors on accelerator.device, these might be redundant.
                         # accelerator.gather_for_metrics should handle device placement.
@@ -329,7 +353,7 @@ def main():
                         # `gather_for_metrics` is used as these are tensors intended for metric computation/logging.
                         gathered_loss_scalars = accelerator.gather_for_metrics(val_batch.get('loss_scalars', {}))
                         gathered_metrics = accelerator.gather_for_metrics(metrics_output.get('metrics', {}))
-                        
+
                         prefixed_gathered_loss_scalars = {f"{dataset_name_prefix}{k}": v for k, v in gathered_loss_scalars.items()}
                         prefixed_gathered_metrics = {f"{dataset_name_prefix}metric_{k}": v for k, v in gathered_metrics.items()}
 
@@ -361,17 +385,17 @@ def main():
                         valid_tensors = [d[key] for d in all_val_metrics_batches if key in d and isinstance(d[key], torch.Tensor) and d[key].numel() > 0]
                         if valid_tensors:
                             avg_val_metrics[key] = torch.cat(valid_tensors).float().mean().item()
-                
+
                 log_val_dict = {**avg_val_loss_scalars, **avg_val_metrics}
-                if log_val_dict: 
+                if log_val_dict:
                     accelerator.log(log_val_dict, step=total_steps)
                     accelerator.print(f"Validation Epoch {epoch} Results: {pprint.pformat(log_val_dict)}")
 
                     # Top-K checkpoint saving logic
                     current_epoch_metric_for_top_k = -float('inf')
                     # Using the average of all reported validation metrics for ranking
-                    selected_metric_name_for_top_k = "average_of_all_val_metrics" 
-                    
+                    selected_metric_name_for_top_k = "average_of_all_val_metrics"
+
                     if avg_val_metrics:
                         metric_values = [v for v in avg_val_metrics.values() if isinstance(v, (int, float))]
                         if metric_values:
@@ -383,29 +407,29 @@ def main():
                         accelerator.print("avg_val_metrics is empty. Cannot determine metric for top-K checkpoint.")
 
                     if current_epoch_metric_for_top_k > -float('inf'): # Proceed if a valid metric was calculated
-                        save_dir = Path(args.output_dir) / args.exp_name
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        
+                        save_dir = run_specific_output_dir # Use run-specific directory
+                        # save_dir.mkdir(parents=True, exist_ok=True) # Already created at the start by main process
+
                         if len(top_k_checkpoints) < K_BEST_CHECKPOINTS or current_epoch_metric_for_top_k > top_k_checkpoints[-1][0]:
                             unwrapped_model = accelerator.unwrap_model(model)
                             best_ckpt_filename = f"best_avg_metric_{current_epoch_metric_for_top_k:.4f}_epoch_{epoch}_step_{total_steps}.ckpt"
                             best_ckpt_save_path = save_dir / best_ckpt_filename
-                            
+
                             accelerator.save(unwrapped_model.state_dict(), str(best_ckpt_save_path))
                             accelerator.print(f"Saved new top-{K_BEST_CHECKPOINTS} checkpoint: {best_ckpt_save_path} with {selected_metric_name_for_top_k}: {current_epoch_metric_for_top_k:.4f}")
-                            
+
                             top_k_checkpoints.append((current_epoch_metric_for_top_k, str(best_ckpt_save_path)))
-                            top_k_checkpoints.sort(key=lambda x: x[0], reverse=True) 
-                            
+                            top_k_checkpoints.sort(key=lambda x: x[0], reverse=True)
+
                             if len(top_k_checkpoints) > K_BEST_CHECKPOINTS:
-                                removed_ckpt_info = top_k_checkpoints.pop() 
+                                removed_ckpt_info = top_k_checkpoints.pop()
                                 removed_ckpt_path_str = removed_ckpt_info[1]
                                 try:
                                     Path(removed_ckpt_path_str).unlink(missing_ok=True)
                                     accelerator.print(f"Removed old top-{K_BEST_CHECKPOINTS} checkpoint: {removed_ckpt_path_str}")
                                 except OSError as e:
                                     accelerator.print(f"Error removing old top-{K_BEST_CHECKPOINTS} checkpoint {removed_ckpt_path_str}: {e}")
-                            
+
                             accelerator.print(f"Current top-{K_BEST_CHECKPOINTS} checkpoints (Metric: {selected_metric_name_for_top_k}):")
                             for score, path_str in top_k_checkpoints:
                                 accelerator.print(f"  Score: {score:.4f}, Path: {path_str}")
@@ -414,11 +438,11 @@ def main():
 
         # --- Save Checkpoint (on main process only) ---
         if epoch % args.save_every_n_epochs == 0 and accelerator.is_main_process:
-            save_dir = Path(args.output_dir) / args.exp_name
-            save_dir.mkdir(parents=True, exist_ok=True)
+            save_dir = run_specific_output_dir # Use run-specific directory
+            # save_dir.mkdir(parents=True, exist_ok=True) # Already created at the start by main process
             ckpt_filename = f"epoch_{epoch}_step_{total_steps}.ckpt"
             save_path = save_dir / ckpt_filename
-            
+
             unwrapped_model = accelerator.unwrap_model(model)
             accelerator.save(unwrapped_model.state_dict(), str(save_path))
             accelerator.print(f"Saved checkpoint (model weights) to {save_path}")
@@ -426,7 +450,7 @@ def main():
     # --- End of Training ---
     if accelerator.is_main_process:
         if profiler:
-             profiler.summary()
+             profiler.summary() # Profiler uses its initialized output_dir
         accelerator.end_training()
         loguru_logger.info("Training finished.")
 

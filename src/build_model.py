@@ -1,8 +1,8 @@
-import wandb
 import torch
 import cv2 as cv
 import numpy as np
 from loguru import logger
+from pathlib import Path # Ensure pathlib is imported
 from src.utils.loss_mask import loss
 from src.utils.utils import draw_bbox
 from src.utils.metrics_mask import metrics
@@ -24,7 +24,7 @@ class ModelTrainer():
             sam_model (SAM2Base): The SAM-2 model instance.
             pretrained_ckpt (str, optional): Path to a pretrained checkpoint. Defaults to None.
             profiler (Profiler, optional): Profiler instance. Defaults to PassThroughProfiler.
-            dump_dir (str, optional): Directory for dumping outputs. Defaults to None.
+            dump_dir (str, optional): Directory for dumping outputs (e.g., visualizations). Defaults to None.
             accelerator (Accelerator, optional): Accelerator instance for distributed training. Defaults to None.
             mask_threshold (float, optional): Threshold for converting mask logits to binary masks.
                 Used by SAM2Transforms. Defaults to 0.0.
@@ -132,27 +132,21 @@ class ModelTrainer():
 
     def _visualize_batch(self, batch: dict, outputs: dict, batch_idx: int, prefix: str = "val", max_samples: int = 4, global_step: int = 0):
         """
-        Visualizes a batch of data and predictions and logs them to WandB.
+        Visualizes a batch of data and predictions and saves them locally.
 
         Args:
             batch (dict): The input batch data.
             outputs (dict): The model outputs for the batch.
             batch_idx (int): The index of the current batch.
-            prefix (str, optional): Prefix for WandB logs (e.g., "val", "train"). Defaults to "val".
+            prefix (str, optional): Prefix for filenames and subdirectories (e.g., "val_ds0_epoch0"). Defaults to "val".
             max_samples (int, optional): Maximum number of samples to visualize from the batch. Defaults to 4.
-            global_step (int, optional): The global training step for WandB logging. Defaults to 0.
+            global_step (int, optional): The global training step, used in filenames. Defaults to 0.
         """
         if not self.accelerator or not self.accelerator.is_main_process:
             return
 
-        wandb_tracker = None
-        try:
-            wandb_tracker = self.accelerator.get_tracker("wandb")
-        except Exception:
-            logger.debug("WandB tracker not found. Visualization will be skipped.")
-
-        if not wandb_tracker or not wandb:
-            logger.warning("WandB tracker not initialized or wandb not imported. Skipping visualization.")
+        if not self.dump_dir:
+            logger.info(f"self.dump_dir is not set in ModelTrainer. Skipping local saving of visualizations for {prefix}, batch {batch_idx}.")
             return
 
         gt_mask_color = (0, 255, 0)
@@ -286,14 +280,33 @@ class ModelTrainer():
                             )
                 vis_mask_pair.append(img_for_mask)
 
+            # Create subdirectory for the current prefix (e.g., val_ds0_epoch0) if it doesn't exist
+            save_path_prefix_dir = Path(self.dump_dir) / prefix
+            try:
+                save_path_prefix_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error(f"Failed to create directory {save_path_prefix_dir}: {e}")
+                continue # Skip saving for this sample if directory creation fails
+
             if len(vis_bbox_pair) == 2:
                 final_vis_bbox_img = np.concatenate(vis_bbox_pair, axis=1)
-                final_vis_bbox_img_tensor = torch.from_numpy(final_vis_bbox_img).permute(2, 0, 1)
-                wandb_tracker.log({f"{prefix}/sample_{batch_idx}_{i}_bboxes": wandb.Image(final_vis_bbox_img_tensor)}, step=global_step)
+                try:
+                    bbox_filename = f"sample_{batch_idx}_{i}_step_{global_step}_bboxes.png"
+                    bbox_save_path = save_path_prefix_dir / bbox_filename
+                    cv.imwrite(str(bbox_save_path), final_vis_bbox_img)
+                    # logger.debug(f"Saved bbox visualization to {bbox_save_path}") 
+                except Exception as e:
+                    logger.error(f"Failed to save bbox visualization for {prefix}, sample {batch_idx}_{i} to {bbox_save_path}: {e}")
+
             if len(vis_mask_pair) == 2:
                 final_vis_mask_img = np.concatenate(vis_mask_pair, axis=1)
-                final_vis_mask_img_tensor = torch.from_numpy(final_vis_mask_img).permute(2, 0, 1)
-                wandb_tracker.log({f"{prefix}/sample_{batch_idx}_{i}_masks": wandb.Image(final_vis_mask_img_tensor)}, step=global_step)
+                try:
+                    mask_filename = f"sample_{batch_idx}_{i}_step_{global_step}_masks.png"
+                    mask_save_path = save_path_prefix_dir / mask_filename
+                    cv.imwrite(str(mask_save_path), final_vis_mask_img)
+                    # logger.debug(f"Saved mask visualization to {mask_save_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save mask visualization for {prefix}, sample {batch_idx}_{i} to {mask_save_path}: {e}")
 
     def _calculate_single_iou(self, gt_mask_tensor: torch.Tensor, pred_mask_tensor: torch.Tensor) -> float:
         """

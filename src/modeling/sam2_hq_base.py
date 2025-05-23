@@ -196,15 +196,15 @@ class SAM2HQBase(torch.nn.Module):
                 fullgraph=True,
                 dynamic=False,
             )
-    
+
         self.num_points = 1
         d_model = self.sam_prompt_encoder.embed_dim
         self.query = nn.Embedding(self.num_points, d_model)
-        
+
         self.prompter = TransformerDecoder(
             d_model=d_model,
             nhead=8,
-            feat_size=40,
+            feat_size=self.image_size // 16,
             no_ker_size=[1, 3, 5],
             num_layers=2
         )
@@ -376,10 +376,7 @@ class SAM2HQBase(torch.nn.Module):
                 ]
             # If not enough FPN levels, high_res_features_for_decoder remains None.
 
-        image_pe_for_decoder = self.sam_prompt_encoder.get_dense_pe().expand(
-            batch_size, -1, -1, -1
-        )
-        image_pe_for_decoder = image_pe_for_decoder[0].unsqueeze(0)
+        image_pe_for_decoder = self.sam_prompt_encoder.get_dense_pe()
 
         b_emb, c_emb, h_emb, w_emb = encoder_embeddings_for_decoder.shape
         emb0 = encoder_embeddings_for_decoder[:, :, :h_emb // 2, :].flatten(-2).permute(0, 2, 1)
@@ -403,7 +400,7 @@ class SAM2HQBase(torch.nn.Module):
         offset = torch.tensor([0, h, 0, h], device=pred_bbox_xyxy1.device, dtype=pred_bbox_xyxy1.dtype)
         box1 = pred_bbox_xyxy1 + offset
         box = torch.stack([box0, box1], 1)
-        
+
         # Adjust ap1 coordinates for combined input_points
         offset_ap = torch.tensor([0, h], device=ap1.device, dtype=ap1.dtype).view(1, 1, 2)
         ap1_m = ap1 + offset_ap
@@ -438,16 +435,16 @@ class SAM2HQBase(torch.nn.Module):
             # Select the best SAM mask from multimask outputs (tokens 1 to num_sam_multimask_outputs)
             iou_for_sam_multimask = raw_iou_pred[:, 1 : 1 + num_sam_multimask_outputs]
             best_sam_idx_local = torch.argmax(iou_for_sam_multimask, dim=1)
-            best_sam_idx_global = best_sam_idx_local + 1 
+            best_sam_idx_global = best_sam_idx_local + 1
             masks_sam = raw_masks[torch.arange(raw_masks.size(0)), best_sam_idx_global].unsqueeze(1)
         else:
             # Select the default single SAM mask (token 0)
             masks_sam = raw_masks[:, 0:1, :, :]
 
         # HQ mask is the last token. In MaskDecoderHQ, num_mask_tokens includes SAM tokens + HQ token.
-        hq_mask_index = self.sam_mask_decoder.num_mask_tokens - 1 
+        hq_mask_index = self.sam_mask_decoder.num_mask_tokens - 1
         masks_hq = raw_masks[:, hq_mask_index : hq_mask_index + 1, :, :]
-        
+
         if hq_token_only:
             return masks_hq, aps, boxes
         else:

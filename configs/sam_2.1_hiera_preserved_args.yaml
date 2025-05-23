@@ -1,18 +1,19 @@
 layer_config:
-  load_weights:
-    - image_encoder
-    - mask_downsample
-    - memory_attention
-    - memory_encoder
-    - sam_prompt_encoder
-    - sam_mask_decoder
-    - obj_ptr_proj
-    - obj_ptr_tpos_proj
-  freeze_layers:
-    - image_encoder
-    - mask_downsample
-    - memory_attention
-    - memory_encoder
-    - sam_prompt_encoder
-    - obj_ptr_proj
-    - obj_ptr_tpos_proj
+    load_weights:
+        - image_encoder
+        - mask_downsample
+        - memory_attention
+        - memory_encoder
+        - sam_prompt_encoder
+        - sam_mask_decoder
+        - obj_ptr_proj
+        - obj_ptr_tpos_proj
+    train_layers:
+        - sam_mask_decoder.hf_token
+        - sam_mask_decoder.hf_mlp
+        - sam_mask_decoder.embedding_maskfeature
+        - sam_mask_decoder.num_mask_tokens
+        - query
+        - prompter
+        - tlbr_reg
+        - heatmap_conv
