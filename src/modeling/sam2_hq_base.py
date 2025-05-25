@@ -15,7 +15,7 @@ from torch.nn.init import trunc_normal_
 from src.modeling.sam.prompt_encoder import PromptEncoder
 from src.modeling.sam.mask_hq_decoder import MaskDecoderHQ
 from src.modeling.sam.transformer import TwoWayTransformer
-from src.modeling.prompter.transformer import TransformerDecoder
+from src.modeling.prompter.transformer import TransformerFuser, TransformerDecoder
 from src.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames, generate_mesh_grid
 
 # a large negative value as a placeholder score for missing objects
@@ -201,6 +201,15 @@ class SAM2HQBase(torch.nn.Module):
         d_model = self.sam_prompt_encoder.embed_dim
         self.query = nn.Embedding(self.num_points, d_model)
 
+        self.fuser = TransformerFuser(
+            feat_size=self.image_size // 16,
+            feat_chan=d_model,
+            depths=[2, 2, 2],
+            num_heads=[8, 8, 8],
+            msa_sizes=[[3, 5, 7], [3, 5, 7]],
+            no_ker_size=[[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+        )
+
         self.prompter = TransformerDecoder(
             d_model=d_model,
             nhead=8,
@@ -271,6 +280,158 @@ class SAM2HQBase(torch.nn.Module):
         )
         return pred_bbox_xyxy1, pred_bbox_xyxy2, pred_bbox_cxywh1, pred_bbox_cxywh2
 
+    def forward(
+        self,
+        img0, img1,
+        multimask_output: bool = False,
+        hq_token_only: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass for SAM2HQBase, processing two separate images.
+        Each image is processed independently but shares the same encoders.
+
+        Args:
+            img0: First image, shape (B, C, H, W).
+            img1: Second image, shape (B, C, H, W).
+            multimask_output: If True, selects the best SAM mask from multiple outputs.
+            hq_token_only: If True, returns only the HQ mask.
+
+        Returns:
+            If hq_token_only is True, returns masks_hq (torch.Tensor).
+            Otherwise, returns a tuple (masks_sam (torch.Tensor), masks_hq (torch.Tensor)).
+        """
+        batch_size, c, h, w = img0.shape
+        self.h1, self.w1 = h, w
+        self.h2, self.w2 = h, w
+
+        # 1. Image Encoding - Process each image separately but use shared encoder
+        backbone_out_dict0 = self.forward_image(img0)
+        backbone_out_dict1 = self.forward_image(img1)
+
+        # Extract features for each image
+        encoder_embeddings_for_decoder0 = backbone_out_dict0['backbone_fpn'][-1]
+        encoder_embeddings_for_decoder1 = backbone_out_dict1['backbone_fpn'][-1]
+
+        # Prepare high-resolution features for each image
+        high_res_features_for_decoder0 = None
+        high_res_features_for_decoder1 = None
+        if self.use_high_res_features_in_sam:
+            if len(backbone_out_dict0['backbone_fpn']) >= 2:
+                high_res_features_for_decoder0 = [
+                    backbone_out_dict0['backbone_fpn'][0],  # Highest res FPN (e.g., s0)
+                    backbone_out_dict0['backbone_fpn'][1]   # Next res FPN (e.g., s1)
+                ]
+            if len(backbone_out_dict1['backbone_fpn']) >= 2:
+                high_res_features_for_decoder1 = [
+                    backbone_out_dict1['backbone_fpn'][0],  # Highest res FPN (e.g., s0)
+                    backbone_out_dict1['backbone_fpn'][1]   # Next res FPN (e.g., s1)
+                ]
+
+        # Get shared positional encoding
+        image_pe_for_decoder = self.sam_prompt_encoder.get_dense_pe()
+
+        # Flatten embeddings for each image
+        b_emb, c_emb, h_emb, w_emb = encoder_embeddings_for_decoder0.shape
+        emb0 = encoder_embeddings_for_decoder0.flatten(-2).permute(0, 2, 1)
+        emb1 = encoder_embeddings_for_decoder1.flatten(-2).permute(0, 2, 1)
+
+        # 2. Prompt Regression - Process each image separately
+        # Initialize query embeddings on the correct device using expand
+        query_weight = self.query.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        prompt_query0 = query_weight.clone()
+        prompt_query1 = query_weight.clone()
+
+        emb0, emb1 = self.fuser(emb0, emb1)
+        
+        # Apply prompter to each image's embeddings
+        prompt_query0 = self.prompter(self.num_points, prompt_query0, emb0)
+        prompt_query1 = self.prompter(self.num_points, prompt_query1, emb1)
+        
+        # Get anchor points for each image
+        ap0, ap1, labels = self.ap_estimation(prompt_query0, emb0, prompt_query1, emb1, h_emb, w_emb, h, w)
+
+        # Size regression for each image
+        tlbr0, tlbr1 = self.size_regression(prompt_query0, prompt_query1)
+
+        # Get bounding boxes for each image
+        boxes = self.obtain_overlap_bbox(ap0.squeeze(1), tlbr0, ap1.squeeze(1), tlbr1)
+        pred_bbox_xyxy0, pred_bbox_xyxy1, _, _ = boxes
+    
+        # Create separate boxes for each image (no offset needed since they're processed separately)
+        box0 = pred_bbox_xyxy0
+        box1 = pred_bbox_xyxy1
+
+        # 3. Process each image through SAM decoder separately
+        # For image 0
+        sparse_embeddings_0, dense_embeddings_0 = self.sam_prompt_encoder(
+            points=(ap0, labels[:, :self.num_points]),  # Only use labels for first image
+            boxes=box0.unsqueeze(1),  # Add box dimension
+            masks=None
+        )
+
+        raw_masks_0, raw_iou_pred_0, _, _ = self.sam_mask_decoder.predict_masks(
+            image_embeddings=encoder_embeddings_for_decoder0,
+            image_pe=image_pe_for_decoder,
+            sparse_prompt_embeddings=sparse_embeddings_0,
+            dense_prompt_embeddings=dense_embeddings_0,
+            repeat_image=False,
+            high_res_features=high_res_features_for_decoder0,
+        )
+
+        # For image 1
+        sparse_embeddings_1, dense_embeddings_1 = self.sam_prompt_encoder(
+            points=(ap1, labels[:, self.num_points:]),  # Use labels for second image
+            boxes=box1.unsqueeze(1),  # Add box dimension
+            masks=None
+        )
+
+        raw_masks_1, raw_iou_pred_1, _, _ = self.sam_mask_decoder.predict_masks(
+            image_embeddings=encoder_embeddings_for_decoder1,
+            image_pe=image_pe_for_decoder,
+            sparse_prompt_embeddings=sparse_embeddings_1,
+            dense_prompt_embeddings=dense_embeddings_1,
+            repeat_image=False,
+            high_res_features=high_res_features_for_decoder1,
+        )
+
+        # 4. Select SAM and HQ masks for each image
+        num_sam_multimask_outputs = self.sam_mask_decoder.num_multimask_outputs
+        hq_mask_index = self.sam_mask_decoder.num_mask_tokens - 1
+
+        # Process masks for image 0
+        if multimask_output:
+            iou_for_sam_multimask_0 = raw_iou_pred_0[:, 1 : 1 + num_sam_multimask_outputs]
+            best_sam_idx_local_0 = torch.argmax(iou_for_sam_multimask_0, dim=1)
+            best_sam_idx_global_0 = best_sam_idx_local_0 + 1
+            masks_sam_0 = raw_masks_0[torch.arange(raw_masks_0.size(0)), best_sam_idx_global_0].unsqueeze(1)
+        else:
+            masks_sam_0 = raw_masks_0[:, 0:1, :, :]
+    
+        masks_hq_0 = raw_masks_0[:, hq_mask_index : hq_mask_index + 1, :, :]
+
+        # Process masks for image 1
+        if multimask_output:
+            iou_for_sam_multimask_1 = raw_iou_pred_1[:, 1 : 1 + num_sam_multimask_outputs]
+            best_sam_idx_local_1 = torch.argmax(iou_for_sam_multimask_1, dim=1)
+            best_sam_idx_global_1 = best_sam_idx_local_1 + 1
+            masks_sam_1 = raw_masks_1[torch.arange(raw_masks_1.size(0)), best_sam_idx_global_1].unsqueeze(1)
+        else:
+            masks_sam_1 = raw_masks_1[:, 0:1, :, :]
+    
+        masks_hq_1 = raw_masks_1[:, hq_mask_index : hq_mask_index + 1, :, :]
+
+        # Combine masks from both images
+        masks_sam = torch.cat([masks_sam_0, masks_sam_1], dim=1)  # Shape: (B, 2, H, W)
+        masks_hq = torch.cat([masks_hq_0, masks_hq_1], dim=1)    # Shape: (B, 2, H, W)
+    
+        # Prepare outputs
+        aps = [ap0, ap1]
+
+        if hq_token_only:
+            return masks_hq, aps, boxes
+        else:
+            return masks_sam, masks_hq, aps, boxes
+
     def ap_estimation(self, prompt_query0, image_embedding0, prompt_query1, image_embedding1, h, w, H, W):
         N, num_points = prompt_query0.shape[:2]
         att0 = torch.einsum('blc, bnc->bln', image_embedding0, prompt_query0)  # [N, hw, num_q]
@@ -321,6 +482,7 @@ class SAM2HQBase(torch.nn.Module):
         ap0 = (prob_map0 * coord_xy_map0).sum(2)  # [N, num_q, 2]
         ap1 = (prob_map1 * coord_xy_map1).sum(2)  # [N, num_q, 2]
 
+        # Create labels for both images (each image has num_points points)
         labels = torch.ones((N, num_points * 2), dtype=torch.int64, device=image_embedding0.device)
 
         return ap0, ap1, labels
@@ -329,138 +491,17 @@ class SAM2HQBase(torch.nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def forward(
-        self,
-        img0, img1,
-        # image_batch: torch.Tensor,
-        # prompt_list: List[Dict[str, Any]],
-        multimask_output: bool = False,
-        hq_token_only: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Forward pass for SAM2HQBase, processing batched images and prompts.
-        Mimics the train.py script's approach by calling the internal MaskDecoderHQ's
-        predict_masks method and then selecting SAM and HQ masks.
-
-        Args:
-            image_batch: Batched images, shape (B, C, H, W).
-            prompt_list: A list of prompt dictionaries, one for each image.
-            multimask_output: If True, selects the best SAM mask from multiple outputs.
-                              Otherwise, uses the default single SAM mask.
-            hq_token_only: If True, returns only the HQ mask.
-
-        Returns:
-            If hq_token_only is True, returns masks_hq (torch.Tensor).
-            Otherwise, returns a tuple (masks_sam (torch.Tensor), masks_hq (torch.Tensor)).
-        """
-        batch_size, c, h, w = img0.shape
-        self.h1, self.w1 = h, w
-        self.h2, self.w2 = h, w
-        imgs = torch.cat([img0, img1], 2)
-
-        # 1. Image Encoding
-        # self.forward_image handles image encoding and pre-processes FPN features
-        # (e.g., conv_s0, conv_s1) if use_high_res_features_in_sam is True.
-        backbone_out_dict = self.forward_image(imgs)
-
-        # Main image embeddings for the decoder (lowest resolution FPN feature)
-        encoder_embeddings_for_decoder = backbone_out_dict['backbone_fpn'][-1]
-
-        high_res_features_for_decoder = None
-        if self.use_high_res_features_in_sam:
-            if len(backbone_out_dict['backbone_fpn']) >= 2:
-                # MaskDecoderHQ expects a list [feat_s0, feat_s1]
-                high_res_features_for_decoder = [
-                    backbone_out_dict['backbone_fpn'][0],  # Highest res FPN (e.g., s0)
-                    backbone_out_dict['backbone_fpn'][1]   # Next res FPN (e.g., s1)
-                ]
-            # If not enough FPN levels, high_res_features_for_decoder remains None.
-
-        image_pe_for_decoder = self.sam_prompt_encoder.get_dense_pe()
-
-        b_emb, c_emb, h_emb, w_emb = encoder_embeddings_for_decoder.shape
-        emb0 = encoder_embeddings_for_decoder[:, :, :h_emb // 2, :].flatten(-2).permute(0, 2, 1)
-        emb1 = encoder_embeddings_for_decoder[:, :, h_emb // 2:, :].flatten(-2).permute(0, 2, 1)
-
-        # 2. Prompt Regression
-        # Initialize query embeddings on the correct device using expand
-        query_weight = self.query.weight.unsqueeze(0).expand(batch_size, -1, -1) # Use expand
-        prompt_query0 = query_weight.clone() # Clone needed if prompter modifies in-place
-        prompt_query1 = query_weight.clone() # Clone needed if prompter modifies in-place
-        prompt_query0 = self.prompter(self.num_points, prompt_query0, emb0)
-        prompt_query1 = self.prompter(self.num_points, prompt_query1, emb1)
-        ap0, ap1, labels = self.ap_estimation(prompt_query0, emb0, prompt_query1, emb1, h_emb // 2, w_emb, h, w)
-
-        tlbr0, tlbr1 = self.size_regression(prompt_query0, prompt_query1)
-
-        boxes = self.obtain_overlap_bbox(ap0.squeeze(1), tlbr0, ap1.squeeze(1), tlbr1) # Ensure squeeze dim is correct if needed
-        pred_bbox_xyxy0, pred_bbox_xyxy1, _, _ = boxes
-        box0 = pred_bbox_xyxy0
-        # Ensure offset tensor is on the correct device
-        offset = torch.tensor([0, h, 0, h], device=pred_bbox_xyxy1.device, dtype=pred_bbox_xyxy1.dtype)
-        box1 = pred_bbox_xyxy1 + offset
-        box = torch.stack([box0, box1], 1)
-
-        # Adjust ap1 coordinates for combined input_points
-        offset_ap = torch.tensor([0, h], device=ap1.device, dtype=ap1.dtype).view(1, 1, 2)
-        ap1_m = ap1 + offset_ap
-        ap = torch.cat((ap0, ap1_m), 1) # Keep stack for forward as it uses boxes
-        aps = [ap0, ap1] # Keep original aps for return if needed
-
-        # 2. Prompt Encoding
-        sparse_embeddings_for_decoder, dense_embeddings_for_decoder = self.sam_prompt_encoder(
-            points=(ap, labels), # Shape ((N, 2, 2), (N, 2))
-            boxes=box, # Shape (N, 2, 4)
-            masks=None
-        )
-
-        # 3. Call Mask Decoder's predict_masks method
-        # self.sam_mask_decoder is an instance of MaskDecoderHQ.
-        # predict_masks returns: masks, iou_pred, mask_tokens_out, object_score_logits
-        # raw_masks shape: (B, num_total_tokens, H, W), raw_iou_pred shape: (B, num_total_tokens)
-        # Token indices for MaskDecoderHQ: 0 (single SAM), 1-3 (multi SAM), 4 (HQ)
-        raw_masks, raw_iou_pred, _, _ = self.sam_mask_decoder.predict_masks(
-            image_embeddings=encoder_embeddings_for_decoder,
-            image_pe=image_pe_for_decoder,
-            sparse_prompt_embeddings=sparse_embeddings_for_decoder,
-            dense_prompt_embeddings=dense_embeddings_for_decoder,
-            repeat_image=False,  # Embeddings are already batched
-            high_res_features=high_res_features_for_decoder,
-        )
-
-        # 4. Select SAM and HQ masks
-        num_sam_multimask_outputs = self.sam_mask_decoder.num_multimask_outputs # Typically 3
-
-        if multimask_output:
-            # Select the best SAM mask from multimask outputs (tokens 1 to num_sam_multimask_outputs)
-            iou_for_sam_multimask = raw_iou_pred[:, 1 : 1 + num_sam_multimask_outputs]
-            best_sam_idx_local = torch.argmax(iou_for_sam_multimask, dim=1)
-            best_sam_idx_global = best_sam_idx_local + 1
-            masks_sam = raw_masks[torch.arange(raw_masks.size(0)), best_sam_idx_global].unsqueeze(1)
-        else:
-            # Select the default single SAM mask (token 0)
-            masks_sam = raw_masks[:, 0:1, :, :]
-
-        # HQ mask is the last token. In MaskDecoderHQ, num_mask_tokens includes SAM tokens + HQ token.
-        hq_mask_index = self.sam_mask_decoder.num_mask_tokens - 1
-        masks_hq = raw_masks[:, hq_mask_index : hq_mask_index + 1, :, :]
-
-        if hq_token_only:
-            return masks_hq, aps, boxes
-        else:
-            return masks_sam, masks_hq, aps, boxes
-
     def _build_sam_heads(self):
         """Build SAM-style prompt encoder and mask decoder."""
         self.sam_prompt_embed_dim = self.hidden_dim
         self.sam_image_embedding_size = self.image_size // self.backbone_stride
 
         # build PromptEncoder and MaskDecoder from SAM
-        # (their hyperparameters like `mask_in_chans=16` are from SAM code)
+        # Note: image_embedding_size is now for single image, not concatenated
         self.sam_prompt_encoder = PromptEncoder(
             embed_dim=self.sam_prompt_embed_dim,
             image_embedding_size=(
-                self.sam_image_embedding_size * 2,
+                self.sam_image_embedding_size,
                 self.sam_image_embedding_size,
             ),
             input_image_size=(self.image_size, self.image_size),

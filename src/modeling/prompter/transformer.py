@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch import Tensor
 from typing import Optional
 from timm.layers import trunc_normal_
-from src.modeling.prompter.CCT import CCAttention, Mlp, _init_weights
+from src.modeling.prompter.CCT import CCTransformer, CCAttention, Mlp, _init_weights
 
 
 def elu_feature_map(x):
@@ -166,6 +166,34 @@ class DecoderLayer(nn.Module):
 
         return tgt
 
+
+class TransformerFuser(nn.Module):
+    def __init__(self,
+                 feat_size,
+                 feat_chan,
+                 depths,
+                 num_heads,
+                 msa_sizes,
+                 no_ker_size):
+        super().__init__()
+
+        self.fuser = CCTransformer(
+            feat_size=feat_size,
+            feat_chan=feat_chan,
+            depths=depths,
+            num_heads=num_heads,
+            msa_sizes=msa_sizes,
+            no_ker_sizes=no_ker_size
+        )
+
+        self.apply(_init_weights)
+
+    def forward(self,
+                feat0,
+                feat1):
+        
+        feat0, feat1 = self.fuser(feat0, feat1)
+        return feat0, feat1
 
 class TransformerDecoder(nn.Module):
     def __init__(self, d_model, nhead, feat_size, no_ker_size, num_layers, norm=None):

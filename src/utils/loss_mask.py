@@ -289,10 +289,10 @@ def loss(batch):
 
     # --- Unpack data from batch ---
     gt_masks = batch["gt_masks"]    # Ground truth masks, e.g., [B, 2, H, W] for pairs
-    gt_masks_r = torch.cat((gt_masks[:, 0, :, :], gt_masks[:, 1, :, :]), dim=1).unsqueeze(1)
+    # gt_masks_r = torch.cat((gt_masks[:, 0, :, :], gt_masks[:, 1, :, :]), dim=1).unsqueeze(1)
     pred_mask = batch["pred_mask"]  # Predicted masks
     h_p, w_p = pred_mask.shape[2], pred_mask.shape[3]  # Predicted mask dimensions
-    gt_masks_r = F.interpolate(gt_masks_r, size=(h_p, w_p), mode='bilinear')
+    gt_masks_r = F.interpolate(gt_masks, size=(h_p, w_p), mode='bilinear')
 
     # Assuming gt_masks are for a pair, get dimensions for each item
     h0, w0 = gt_masks[:, 0].shape[1], gt_masks[:, 0].shape[2]
@@ -310,7 +310,10 @@ def loss(batch):
     # ------ MASK LOSS (e.g., BCE/Focal + Dice) ------
     # loss_masks function returns batch-averaged scalar losses
     # Normalize gt_masks from [0, 255] to [0, 1] if necessary for loss_masks
-    point_loss_mask, point_loss_dice = loss_masks(pred_mask, gt_masks_r, len(pred_mask))
+    point_loss_mask0, point_loss_dice0 = loss_masks(pred_mask[:, 0, :, :].unsqueeze(1), gt_masks_r[:, 0, :, :].unsqueeze(1), len(pred_mask))
+    point_loss_mask1, point_loss_dice1 = loss_masks(pred_mask[:, 1, :, :].unsqueeze(1), gt_masks_r[:, 1, :, :].unsqueeze(1), len(pred_mask))
+    point_loss_mask = (point_loss_mask0 + point_loss_mask1) / 2
+    point_loss_dice = (point_loss_dice0 + point_loss_dice1) / 2
     mask_loss = point_loss_mask + point_loss_dice  # Total mask loss
     
     loss_scalars.update({
