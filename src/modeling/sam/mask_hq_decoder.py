@@ -30,6 +30,9 @@ class MaskDecoderHQ(nn.Module):
         pred_obj_scores: bool = False,
         pred_obj_scores_mlp: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
+        pred_bbox: bool = True,
+        bbox_head_depth: int = 3,
+        bbox_head_hidden_dim: int = 256, 
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -118,7 +121,16 @@ class MaskDecoderHQ(nn.Module):
         
         self.num_mask_tokens = self.num_mask_tokens + 1
         
-        
+        self.pred_bbox = pred_bbox
+        if self.pred_bbox:
+            self.bbox_token = nn.Embedding(1, transformer_dim)
+            self.bbox_prediction_head = MLP(
+                transformer_dim,
+                bbox_head_hidden_dim,
+                4,
+                bbox_head_depth,
+                sigmoid_output=True,
+            )
 
     def forward(
         self,
@@ -130,7 +142,7 @@ class MaskDecoderHQ(nn.Module):
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
         hq_token_only: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
 
@@ -146,8 +158,10 @@ class MaskDecoderHQ(nn.Module):
           torch.Tensor: batched predicted masks
           torch.Tensor: batched predictions of mask quality
           torch.Tensor: batched SAM token for mask output
+          torch.Tensor: batched object score logits
+          torch.Tensor: batched predicted bounding boxes (x1, y1, x2, y2)
         """
-        masks, iou_pred, mask_tokens_out, object_score_logits = self.predict_masks(
+        masks, iou_pred, mask_tokens_out, object_score_logits, bbox_pred = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -167,22 +181,18 @@ class MaskDecoderHQ(nn.Module):
             iou_pred = iou_pred[:, 0:1]
 
         masks_hq = masks[:,slice(self.num_mask_tokens-1, self.num_mask_tokens), :, :]
+        
         if multimask_output and self.use_multimask_token_for_obj_ptr:
-            sam_tokens_out = mask_tokens_out[:, 1:self.num_mask_tokens - 1]  # [b, 3, c] shape
+            sam_tokens_out = mask_tokens_out[:, 1:self.num_mask_tokens - 1]
         else:
-            # Take the mask output token. Here we *always* use the token for single mask output.
-            # At test time, even if we track after 1-click (and using multimask_output=True),
-            # we still take the single mask token here. The rationale is that we always track
-            # after multiple clicks during training, so the past tokens seen during training
-            # are always the single mask token (and we'll let it be the object-memory token).
-            sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
+            sam_tokens_out = mask_tokens_out[:, 0:1]
 
         if hq_token_only:
             masks_out = masks_hq
         else:
             masks_out = masks_hq + masks_sam
-        # Prepare output
-        return masks_out, iou_pred, sam_tokens_out, object_score_logits
+            
+        return masks_out, iou_pred, sam_tokens_out, object_score_logits, bbox_pred
 
     def predict_masks(
         self,
@@ -192,25 +202,27 @@ class MaskDecoderHQ(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts masks. See 'forward' for more details."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predicts masks and bounding boxes."""
         # Concatenate output tokens
         s = 0
+        token_list = []
+        
         if self.pred_obj_scores:
-            output_tokens = torch.cat(
-                [
-                    self.obj_score_token.weight,
-                    self.iou_token.weight,
-                    self.mask_tokens.weight,
-                    self.hf_token.weight
-                ],
-                dim=0,
-            )
-            s = 1
-        else:
-            output_tokens = torch.cat(
-                [self.iou_token.weight, self.mask_tokens.weight], dim=0
-            )
+            token_list.append(self.obj_score_token.weight)
+            s += 1
+            
+        token_list.extend([
+            self.iou_token.weight,
+            self.mask_tokens.weight,
+        ])
+        
+        if self.pred_bbox:
+            token_list.append(self.bbox_token.weight)
+            
+        token_list.append(self.hf_token.weight)
+        
+        output_tokens = torch.cat(token_list, dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
         )
@@ -231,8 +243,19 @@ class MaskDecoderHQ(nn.Module):
 
         # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
-        iou_token_out = hs[:, s, :]
-        mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
+        
+        # Extract different token outputs
+        current_idx = s
+        iou_token_out = hs[:, current_idx, :]
+        current_idx += 1
+        
+        mask_tokens_out = hs[:, current_idx : current_idx + self.num_mask_tokens, :]
+        current_idx += self.num_mask_tokens
+        
+        # Extract bbox token output if enabled
+        if self.pred_bbox:
+            bbox_token_out = hs[:, current_idx, :]
+            current_idx += 1
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
@@ -256,22 +279,27 @@ class MaskDecoderHQ(nn.Module):
                 hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding.shape
-        # masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+        
         masks_sam = (hyper_in[:,:4] @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
         masks_ours = (hyper_in[:,4:] @ upscaled_embedding_ours.view(b, c, h * w)).view(b, -1, h, w)
         masks = torch.cat([masks_sam,masks_ours],dim=1)
 
-
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
+        
+        # Generate bbox predictions
+        if self.pred_bbox:
+            bbox_pred = self.bbox_prediction_head(bbox_token_out)
+        else:
+            bbox_pred = None
+            
         if self.pred_obj_scores:
             assert s == 1
             object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
         else:
-            # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        return masks, iou_pred, mask_tokens_out, object_score_logits
+        return masks, iou_pred, mask_tokens_out, object_score_logits, bbox_pred
 
     def _get_stability_scores(self, mask_logits):
         """

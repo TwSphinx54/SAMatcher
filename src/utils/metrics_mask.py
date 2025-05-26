@@ -27,7 +27,7 @@ def compute_boundary_iou(preds, target):
 def metrics(batch):
     gt_masks = batch["gt_masks"]    # Ground truth masks, e.g., [B, 2, H, W] for pairs
     # gt_masks_r = torch.cat((gt_masks[:, 0, :, :], gt_masks[:, 1, :, :]), dim=1).unsqueeze(1)
-    pred_mask = torch.sigmoid(batch["pred_mask"])  # Predicted masks
+    pred_mask = batch["pred_mask"]  # Predicted masks
     pred_mask_r = F.interpolate(pred_mask, size=gt_masks.size()[2:], mode='bilinear', align_corners=False)
 
     # ------ MASK METRICS ------ #

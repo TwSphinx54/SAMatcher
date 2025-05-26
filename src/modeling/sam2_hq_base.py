@@ -6,17 +6,17 @@
 
 import torch
 import torch.nn.functional as F
-from typing import List, Dict, Any, Tuple, Union
-import torch.nn as nn
-from einops.einops import rearrange
+from typing import Tuple, Union
 
 from torch.nn.init import trunc_normal_
 
 from src.modeling.sam.prompt_encoder import PromptEncoder
 from src.modeling.sam.mask_hq_decoder import MaskDecoderHQ
 from src.modeling.sam.transformer import TwoWayTransformer
-from src.modeling.prompter.transformer import TransformerFuser, TransformerDecoder
-from src.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames, generate_mesh_grid
+from src.modeling.prompter.transformer import TransformerFuser
+# from src.modeling.prompter.lwapp import LWAPP
+from src.modeling.prompter.prompter import Prompter
+from src.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
@@ -197,9 +197,7 @@ class SAM2HQBase(torch.nn.Module):
                 dynamic=False,
             )
 
-        self.num_points = 1
         d_model = self.sam_prompt_encoder.embed_dim
-        self.query = nn.Embedding(self.num_points, d_model)
 
         self.fuser = TransformerFuser(
             feat_size=self.image_size // 16,
@@ -210,7 +208,8 @@ class SAM2HQBase(torch.nn.Module):
             no_ker_size=[[1, 3, 5], [1, 3, 5], [1, 3, 5]]
         )
 
-        self.prompter = TransformerDecoder(
+        # self.prompter = LWAPP(d_model=d_model)
+        self.prompter = Prompter(
             d_model=d_model,
             nhead=8,
             feat_size=self.image_size // 16,
@@ -218,74 +217,8 @@ class SAM2HQBase(torch.nn.Module):
             num_layers=2
         )
 
-        self.tlbr_reg = nn.Sequential(
-            nn.Linear(d_model, d_model, False),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, 4),
-        )
-
-        self.heatmap_conv = nn.Sequential(
-            nn.Conv2d(
-                d_model,
-                d_model,
-                (3, 3),
-                padding=(1, 1),
-                stride=(1, 1),
-                bias=True,
-            ),
-            nn.GroupNorm(32, d_model),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(d_model, 1, (1, 1)),
-        )
-
-        self.softmax_temperature = 1
-
-    def size_regression(self, hs1, hs2):
-        tlbr1 = self.tlbr_reg(hs1).sigmoid().squeeze(1)
-        tlbr2 = self.tlbr_reg(hs2).sigmoid().squeeze(1)
-        return tlbr1, tlbr2
-
-    def obtain_overlap_bbox(self, box_cxy1, tlbr1, box_cxy2, tlbr2):
-        pred_bbox_xyxy1 = torch.stack(
-            [
-                box_cxy1[:, 0] - tlbr1[:, 1] * self.w1,
-                box_cxy1[:, 1] - tlbr1[:, 0] * self.h1,
-                box_cxy1[:, 0] + tlbr1[:, 3] * self.w1,
-                box_cxy1[:, 1] + tlbr1[:, 2] * self.h1,
-            ],
-            dim=1,
-        )
-        pred_bbox_xyxy2 = torch.stack(
-            [
-                box_cxy2[:, 0] - tlbr2[:, 1] * self.w2,
-                box_cxy2[:, 1] - tlbr2[:, 0] * self.h2,
-                box_cxy2[:, 0] + tlbr2[:, 3] * self.w2,
-                box_cxy2[:, 1] + tlbr2[:, 2] * self.h2,
-            ],
-            dim=1,
-        )
-        pred_bbox_cxywh1 = torch.cat(
-            [
-                (pred_bbox_xyxy1[:, :2] + pred_bbox_xyxy1[:, 2:]) / 2,
-                pred_bbox_xyxy1[:, 2:] - pred_bbox_xyxy1[:, :2],
-            ],
-            dim=-1,
-        )
-        pred_bbox_cxywh2 = torch.cat(
-            [
-                (pred_bbox_xyxy2[:, :2] + pred_bbox_xyxy2[:, 2:]) / 2,
-                pred_bbox_xyxy2[:, 2:] - pred_bbox_xyxy2[:, :2],
-            ],
-            dim=-1,
-        )
-        return pred_bbox_xyxy1, pred_bbox_xyxy2, pred_bbox_cxywh1, pred_bbox_cxywh2
-
-    def forward(
-        self,
-        img0, img1,
-        multimask_output: bool = False,
-        hq_token_only: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    
+    def forward(self, img0, img1) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass for SAM2HQBase, processing two separate images.
         Each image is processed independently but shares the same encoders.
@@ -301,8 +234,6 @@ class SAM2HQBase(torch.nn.Module):
             Otherwise, returns a tuple (masks_sam (torch.Tensor), masks_hq (torch.Tensor)).
         """
         batch_size, c, h, w = img0.shape
-        self.h1, self.w1 = h, w
-        self.h2, self.w2 = h, w
 
         # 1. Image Encoding - Process each image separately but use shared encoder
         backbone_out_dict0 = self.forward_image(img0)
@@ -336,156 +267,55 @@ class SAM2HQBase(torch.nn.Module):
         emb1 = encoder_embeddings_for_decoder1.flatten(-2).permute(0, 2, 1)
 
         # 2. Prompt Regression - Process each image separately
-        # Initialize query embeddings on the correct device using expand
-        query_weight = self.query.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        prompt_query0 = query_weight.clone()
-        prompt_query1 = query_weight.clone()
-
         emb0, emb1 = self.fuser(emb0, emb1)
-        
-        # Apply prompter to each image's embeddings
-        prompt_query0 = self.prompter(self.num_points, prompt_query0, emb0)
-        prompt_query1 = self.prompter(self.num_points, prompt_query1, emb1)
-        
-        # Get anchor points for each image
-        ap0, ap1, labels = self.ap_estimation(prompt_query0, emb0, prompt_query1, emb1, h_emb, w_emb, h, w)
 
-        # Size regression for each image
-        tlbr0, tlbr1 = self.size_regression(prompt_query0, prompt_query1)
-
-        # Get bounding boxes for each image
-        boxes = self.obtain_overlap_bbox(ap0.squeeze(1), tlbr0, ap1.squeeze(1), tlbr1)
-        pred_bbox_xyxy0, pred_bbox_xyxy1, _, _ = boxes
-    
-        # Create separate boxes for each image (no offset needed since they're processed separately)
-        box0 = pred_bbox_xyxy0
-        box1 = pred_bbox_xyxy1
+        ap0, ap1, labels = self.prompter(emb0, emb1, h_emb, w_emb, h, w)
+        aps = [ap0, ap1]
 
         # 3. Process each image through SAM decoder separately
         # For image 0
         sparse_embeddings_0, dense_embeddings_0 = self.sam_prompt_encoder(
-            points=(ap0, labels[:, :self.num_points]),  # Only use labels for first image
-            boxes=box0.unsqueeze(1),  # Add box dimension
+            points=(ap0, labels[:, :1]),  # Only use labels for first image
+            boxes=None,
             masks=None
         )
 
-        raw_masks_0, raw_iou_pred_0, _, _ = self.sam_mask_decoder.predict_masks(
+        masks0, iou_pred0, sam_tokens_out0, object_score_logits0, bbox_pred0 = self.sam_mask_decoder(
             image_embeddings=encoder_embeddings_for_decoder0,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_0,
             dense_prompt_embeddings=dense_embeddings_0,
+            multimask_output=False,
             repeat_image=False,
             high_res_features=high_res_features_for_decoder0,
+            hq_token_only=False
         )
 
         # For image 1
         sparse_embeddings_1, dense_embeddings_1 = self.sam_prompt_encoder(
-            points=(ap1, labels[:, self.num_points:]),  # Use labels for second image
-            boxes=box1.unsqueeze(1),  # Add box dimension
+            points=(ap1, labels[:, 1:]),  # Use labels for second image
+            boxes=None,
             masks=None
         )
 
-        raw_masks_1, raw_iou_pred_1, _, _ = self.sam_mask_decoder.predict_masks(
+        masks1, iou_pred1, sam_tokens_out1, object_score_logits1, bbox_pred1 = self.sam_mask_decoder(
             image_embeddings=encoder_embeddings_for_decoder1,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_1,
             dense_prompt_embeddings=dense_embeddings_1,
+            multimask_output=False,
             repeat_image=False,
             high_res_features=high_res_features_for_decoder1,
+            hq_token_only=False
         )
 
-        # 4. Select SAM and HQ masks for each image
-        num_sam_multimask_outputs = self.sam_mask_decoder.num_multimask_outputs
-        hq_mask_index = self.sam_mask_decoder.num_mask_tokens - 1
-
-        # Process masks for image 0
-        if multimask_output:
-            iou_for_sam_multimask_0 = raw_iou_pred_0[:, 1 : 1 + num_sam_multimask_outputs]
-            best_sam_idx_local_0 = torch.argmax(iou_for_sam_multimask_0, dim=1)
-            best_sam_idx_global_0 = best_sam_idx_local_0 + 1
-            masks_sam_0 = raw_masks_0[torch.arange(raw_masks_0.size(0)), best_sam_idx_global_0].unsqueeze(1)
-        else:
-            masks_sam_0 = raw_masks_0[:, 0:1, :, :]
-    
-        masks_hq_0 = raw_masks_0[:, hq_mask_index : hq_mask_index + 1, :, :]
-
-        # Process masks for image 1
-        if multimask_output:
-            iou_for_sam_multimask_1 = raw_iou_pred_1[:, 1 : 1 + num_sam_multimask_outputs]
-            best_sam_idx_local_1 = torch.argmax(iou_for_sam_multimask_1, dim=1)
-            best_sam_idx_global_1 = best_sam_idx_local_1 + 1
-            masks_sam_1 = raw_masks_1[torch.arange(raw_masks_1.size(0)), best_sam_idx_global_1].unsqueeze(1)
-        else:
-            masks_sam_1 = raw_masks_1[:, 0:1, :, :]
-    
-        masks_hq_1 = raw_masks_1[:, hq_mask_index : hq_mask_index + 1, :, :]
-
         # Combine masks from both images
-        masks_sam = torch.cat([masks_sam_0, masks_sam_1], dim=1)  # Shape: (B, 2, H, W)
-        masks_hq = torch.cat([masks_hq_0, masks_hq_1], dim=1)    # Shape: (B, 2, H, W)
-    
-        # Prepare outputs
-        aps = [ap0, ap1]
+        masks = torch.cat([masks0, masks1], dim=1)  # Shape: (B, 2, H, W)
+        bbox_pred0 = bbox_pred0 * torch.tensor([w, h, w, h], device=bbox_pred0.device)
+        bbox_pred1 = bbox_pred1 * torch.tensor([w, h, w, h], device=bbox_pred1.device)
+        boxes = (bbox_pred0, bbox_pred1)
 
-        if hq_token_only:
-            return masks_hq, aps, boxes
-        else:
-            return masks_sam, masks_hq, aps, boxes
-
-    def ap_estimation(self, prompt_query0, image_embedding0, prompt_query1, image_embedding1, h, w, H, W):
-        N, num_points = prompt_query0.shape[:2]
-        att0 = torch.einsum('blc, bnc->bln', image_embedding0, prompt_query0)  # [N, hw, num_q]
-        att1 = torch.einsum('blc, bnc->bln', image_embedding1, prompt_query1)  # [N, hw, num_q]
-
-        # Adjust dimensions for element-wise multiplication
-        att0 = att0.unsqueeze(2)  # [N, hw, 1, num_q]
-        image_embedding0 = image_embedding0.unsqueeze(-1)  # [N, hw, c, 1]
-        att1 = att1.unsqueeze(2)  # [N, hw, 1, num_q]
-        image_embedding1 = image_embedding1.unsqueeze(-1)  # [N, hw, c, 1]
-
-        # weighted sum for center regression
-        heatmap0 = rearrange(image_embedding0 * att0, 'n (h w) c q -> n q c h w', h=h, w=w)
-        heatmap1 = rearrange(image_embedding1 * att1, 'n (h w) c q -> n q c h w', h=h, w=w)
-
-        # Merge q dimension with batch dimension n
-        heatmap0 = heatmap0.reshape(-1, heatmap0.shape[2], heatmap0.shape[3], heatmap0.shape[4])  # [N*q, c, h, w]
-        heatmap1 = heatmap1.reshape(-1, heatmap1.shape[2], heatmap1.shape[3], heatmap1.shape[4])  # [N*q, c, h, w]
-
-        # Apply heatmap_conv
-        heatmap_flatten0 = rearrange(
-            self.heatmap_conv(heatmap0),
-            '(n q) c h w -> n q (h w) c', q=num_points
-        ) * self.softmax_temperature  # [N, q, h*w, c]
-        heatmap_flatten1 = rearrange(
-            self.heatmap_conv(heatmap1),
-            '(n q) c h w -> n q (h w) c', q=num_points
-        ) * self.softmax_temperature  # [N, q, h*w, c]
-
-        prob_map0 = nn.functional.softmax(heatmap_flatten0, dim=2)  # [N, q, h*w, c]
-        prob_map1 = nn.functional.softmax(heatmap_flatten1, dim=2)  # [N, q, h*w, c]
-
-        stride_h = H // h
-        stride_w = W // w
-        coord_xy_map0 = generate_mesh_grid(
-            (h, w),
-            stride_h=stride_h,
-            stride_w=stride_w,
-            device=image_embedding0.device
-        ).unsqueeze(1)  # [1, 1, h*w, 2]
-        coord_xy_map1 = generate_mesh_grid(
-            (h, w),
-            stride_h=stride_h,
-            stride_w=stride_w,
-            device=image_embedding1.device
-        ).unsqueeze(1)  # [1, 1, h*w, 2]
-
-        ap0 = (prob_map0 * coord_xy_map0).sum(2)  # [N, num_q, 2]
-        ap1 = (prob_map1 * coord_xy_map1).sum(2)  # [N, num_q, 2]
-
-        # Create labels for both images (each image has num_points points)
-        labels = torch.ones((N, num_points * 2), dtype=torch.int64, device=image_embedding0.device)
-
-        return ap0, ap1, labels
+        return masks, aps, boxes
 
     @property
     def device(self):

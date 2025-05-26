@@ -98,9 +98,8 @@ class ModelTrainer():
             image0 = batch['image0'].unsqueeze(0) if batch['image0'].ndim == 3 else batch['image0']
             image1 = batch['image1'].unsqueeze(0) if batch['image1'].ndim == 3 else batch['image1']
 
-            mask_sam, mask, aps, boxes = self.model(image0, image1, hq_token_only=False)
+            mask, aps, boxes = self.model(image0, image1)
             batch.update({
-                'sam_mask': mask_sam,
                 'pred_mask': mask,
                 'pred_ap': aps,
                 'boxes': boxes

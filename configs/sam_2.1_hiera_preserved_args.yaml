@@ -14,8 +14,8 @@ layer_config:
         # - sam_mask_decoder.embedding_maskfeature
         # - sam_mask_decoder.num_mask_tokens
         - sam_mask_decoder
-        - query
+        # - query
         - fuser
         - prompter
-        - tlbr_reg
-        - heatmap_conv
+        # - tlbr_reg
+        # - heatmap_conv
