@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import cv2 as cv
 import numpy as np
 from loguru import logger
@@ -182,26 +183,23 @@ class ModelTrainer():
 
         pred_mask_logits_batch = outputs['pred_mask']
 
-        if pred_mask_logits_batch.shape[1] == 1 and pred_mask_logits_batch.ndim == 4 and pred_mask_logits_batch.shape[2] == 2 * H:
-            pred_mask_squeezed = pred_mask_logits_batch.squeeze(1)
-            pred_mask0_logits, pred_mask1_logits = torch.split(pred_mask_squeezed, H, dim=1)
-            pred_masks_processed = torch.stack([pred_mask0_logits, pred_mask1_logits], dim=1)
-        elif pred_mask_logits_batch.shape[1] == 2 and pred_mask_logits_batch.ndim == 4 and pred_mask_logits_batch.shape[2] == H:
-            pred_masks_processed = pred_mask_logits_batch
-        else:
-            self.accelerator.print(
-                f"Rank {self.accelerator.process_index}: Warning: pred_mask shape {pred_mask_logits_batch.shape} "
-                f"not directly visualizable (expected B,1,2H,W or B,2,H,W). Skipping mask visualization."
-            )
-            pred_masks_processed = torch.zeros_like(gt_masks_batch, device=gt_masks_batch.device, dtype=gt_masks_batch.dtype)
-
+        pred_masks_processed = F.interpolate(
+            pred_mask_logits_batch, 
+            size=(H, W), 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
         pred_masks_binary_batch = (torch.sigmoid(pred_masks_processed) > 0.5).float()
 
         for i in range(num_samples_to_vis):
             img0_tensor = images0[i]
             img1_tensor = images1[i]
+            # Convert RGB to BGR for OpenCV
             img0_np_orig = (img0_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img0_np_orig = cv.cvtColor(img0_np_orig, cv.COLOR_RGB2BGR)
             img1_np_orig = (img1_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img1_np_orig = cv.cvtColor(img1_np_orig, cv.COLOR_RGB2BGR)
 
             vis_bbox_pair = []
             vis_mask_pair = []

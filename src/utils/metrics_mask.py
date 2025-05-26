@@ -26,16 +26,19 @@ def compute_boundary_iou(preds, target):
 
 def metrics(batch):
     gt_masks = batch["gt_masks"]    # Ground truth masks, e.g., [B, 2, H, W] for pairs
-    gt_masks_r = torch.cat((gt_masks[:, 0, :, :], gt_masks[:, 1, :, :]), dim=1).unsqueeze(1)
-    pred_mask = batch["pred_mask"]  # Predicted masks
-    pred_mask_r = F.interpolate(pred_mask, size=gt_masks_r.size()[2:], mode='bilinear', align_corners=False)
-    batch["pred_mask"] = pred_mask_r
+    # gt_masks_r = torch.cat((gt_masks[:, 0, :, :], gt_masks[:, 1, :, :]), dim=1).unsqueeze(1)
+    pred_mask = torch.sigmoid(batch["pred_mask"])  # Predicted masks
+    pred_mask_r = F.interpolate(pred_mask, size=gt_masks.size()[2:], mode='bilinear', align_corners=False)
 
     # ------ MASK METRICS ------ #
-    mask_iou = compute_iou(pred_mask_r, gt_masks_r) * 100
-    boundary_iou = compute_boundary_iou(pred_mask_r, gt_masks_r) * 100
+    mask_iou0 = compute_iou(pred_mask_r[:, 0, :, :].unsqueeze(1), gt_masks[:, 0, :, :].unsqueeze(1)) * 100
+    mask_iou1 = compute_iou(pred_mask_r[:, 1, :, :].unsqueeze(1), gt_masks[:, 1, :, :].unsqueeze(1)) * 100
+    mask_iou = (mask_iou0 + mask_iou1) / 2
+    boundary_iou0 = compute_boundary_iou(pred_mask_r[:, 0, :, :].unsqueeze(1), gt_masks[:, 0, :, :].unsqueeze(1)) * 100
+    boundary_iou1 = compute_boundary_iou(pred_mask_r[:, 1, :, :].unsqueeze(1), gt_masks[:, 1, :, :].unsqueeze(1)) * 100
+    boundary_iou = (boundary_iou0 + boundary_iou1) / 2
 
-    # --- Bounding Box IoU/OIoU Metrics ---
+    # --- Bounding Box IoU/OIoU Metrics --- #
     pred_bbox_xyxy0 = batch['boxes'][0].float()
     pred_bbox_xyxy1 = batch['boxes'][1].float()
     gt_bbox_xyxy0 = batch['bbox0'].float()
