@@ -819,7 +819,7 @@ def mask_iou(pred_label,label):
     calculate mask iou for pred_label and gt_label
     '''
 
-    pred_label = (pred_label>0)[0].int()
+    pred_label = (pred_label>0.5)[0].int()
     label = (label>0.5)[0].int()
 
     intersection = ((label * pred_label) > 0).sum()
@@ -860,7 +860,7 @@ def boundary_iou(gt, dt, dilation_ratio=0.02):
     :return: boundary iou (float)
     """
     device = gt.device
-    dt = (dt>0)[0].cpu().byte().numpy()
+    dt = (dt>0.5)[0].cpu().byte().numpy()
     gt = (gt>0.5)[0].cpu().byte().numpy()
 
     gt_boundary = mask_to_boundary(gt, dilation_ratio)
