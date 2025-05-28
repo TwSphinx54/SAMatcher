@@ -280,7 +280,7 @@ class SAM2HQBase(torch.nn.Module):
             masks=None
         )
 
-        masks0, iou_pred0, sam_tokens_out0, object_score_logits0, bbox_pred0 = self.sam_mask_decoder(
+        masks0, iou_pred0, sam_tokens_out0, object_score_logits0, tlbr0 = self.sam_mask_decoder(
             image_embeddings=encoder_embeddings_for_decoder0,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_0,
@@ -298,7 +298,7 @@ class SAM2HQBase(torch.nn.Module):
             masks=None
         )
 
-        masks1, iou_pred1, sam_tokens_out1, object_score_logits1, bbox_pred1 = self.sam_mask_decoder(
+        masks1, iou_pred1, sam_tokens_out1, object_score_logits1, tlbr1 = self.sam_mask_decoder(
             image_embeddings=encoder_embeddings_for_decoder1,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_1,
@@ -311,11 +311,45 @@ class SAM2HQBase(torch.nn.Module):
 
         # Combine masks from both images
         masks = torch.cat([masks0, masks1], dim=1)  # Shape: (B, 2, H, W)
-        bbox_pred0 = bbox_pred0 * torch.tensor([w, h, w, h], device=bbox_pred0.device)
-        bbox_pred1 = bbox_pred1 * torch.tensor([w, h, w, h], device=bbox_pred1.device)
-        boxes = (bbox_pred0, bbox_pred1)
+
+        boxes = self.obtain_overlap_bbox(ap0.squeeze(1), tlbr0, ap1.squeeze(1), tlbr1, h, w, h, w)
 
         return masks, aps, boxes
+
+    def obtain_overlap_bbox(self, box_cxy1, tlbr1, box_cxy2, tlbr2, h1, w1, h2, w2):
+        pred_bbox_xyxy1 = torch.stack(
+            [
+                box_cxy1[:, 0] - tlbr1[:, 1] * w1,
+                box_cxy1[:, 1] - tlbr1[:, 0] * h1,
+                box_cxy1[:, 0] + tlbr1[:, 3] * w1,
+                box_cxy1[:, 1] + tlbr1[:, 2] * h1,
+            ],
+            dim=1,
+        )
+        pred_bbox_xyxy2 = torch.stack(
+            [
+                box_cxy2[:, 0] - tlbr2[:, 1] * w2,
+                box_cxy2[:, 1] - tlbr2[:, 0] * h2,
+                box_cxy2[:, 0] + tlbr2[:, 3] * w2,
+                box_cxy2[:, 1] + tlbr2[:, 2] * h2,
+            ],
+            dim=1,
+        )
+        pred_bbox_cxywh1 = torch.cat(
+            [
+                (pred_bbox_xyxy1[:, :2] + pred_bbox_xyxy1[:, 2:]) / 2,
+                pred_bbox_xyxy1[:, 2:] - pred_bbox_xyxy1[:, :2],
+            ],
+            dim=-1,
+        )
+        pred_bbox_cxywh2 = torch.cat(
+            [
+                (pred_bbox_xyxy2[:, :2] + pred_bbox_xyxy2[:, 2:]) / 2,
+                pred_bbox_xyxy2[:, 2:] - pred_bbox_xyxy2[:, :2],
+            ],
+            dim=-1,
+        )
+        return pred_bbox_xyxy1, pred_bbox_xyxy2, pred_bbox_cxywh1, pred_bbox_cxywh2
 
     @property
     def device(self):
