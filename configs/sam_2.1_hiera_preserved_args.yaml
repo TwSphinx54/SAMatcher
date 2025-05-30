@@ -9,13 +9,9 @@ layer_config:
         - obj_ptr_proj
         - obj_ptr_tpos_proj
     train_layers:
-        # - sam_mask_decoder.hf_token
-        # - sam_mask_decoder.hf_mlp
-        # - sam_mask_decoder.embedding_maskfeature
-        # - sam_mask_decoder.num_mask_tokens
         - sam_mask_decoder
-        # - query
         - fuser
-        - prompter
-        # - tlbr_reg
-        # - heatmap_conv
+        - sparse_lemb0
+        - sparse_lemb1
+        - dense_lemb0
+        - dense_lemb1

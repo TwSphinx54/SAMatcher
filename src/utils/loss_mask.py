@@ -299,7 +299,9 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
     gt_bbox_cxywh0 = box_xyxy_to_cxywh(gt_bbox_xyxy0, max_h=h0, max_w=w0)
     gt_bbox_cxywh1 = box_xyxy_to_cxywh(gt_bbox_xyxy1, max_h=h1, max_w=w1)
 
-    pred_bbox_xyxy0, pred_bbox_xyxy1, pred_bbox_cxywh0, pred_bbox_cxywh1 = batch["boxes"]
+    pred_bbox_xyxy0, pred_bbox_xyxy1 = batch["boxes"]
+    pred_bbox_cxywh0 = box_xyxy_to_cxywh(pred_bbox_xyxy0, max_h=h0, max_w=w0)
+    pred_bbox_cxywh1 = box_xyxy_to_cxywh(pred_bbox_xyxy1, max_h=h0, max_w=w0)
     
     # ===== MASK LOSS COMPUTATION =====
     

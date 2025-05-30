@@ -98,10 +98,9 @@ class ModelTrainer():
             image0 = batch['image0'].unsqueeze(0) if batch['image0'].ndim == 3 else batch['image0']
             image1 = batch['image1'].unsqueeze(0) if batch['image1'].ndim == 3 else batch['image1']
 
-            mask, aps, boxes = self.model(image0, image1)
+            mask, boxes = self.model(image0, image1)
             batch.update({
                 'pred_mask': mask,
-                'pred_ap': aps,
                 'boxes': boxes
             })
 
@@ -151,7 +150,6 @@ class ModelTrainer():
 
         gt_mask_color = (0, 255, 0)
         pred_mask_color = (0, 0, 255)
-        anchor_color = (255, 0, 255)
         text_color = (255, 255, 255)
         font_scale = 0.5
         thickness = 1
@@ -169,13 +167,6 @@ class ModelTrainer():
         if isinstance(model_boxes_output, (tuple, list)) and len(model_boxes_output) >= 2:
             pred_bboxes0_model_output_batch = model_boxes_output[0]
             pred_bboxes1_model_output_batch = model_boxes_output[1]
-
-        model_ap_output = outputs.get('pred_ap')
-        pred_ap0_model_output_batch = None
-        pred_ap1_model_output_batch = None
-        if isinstance(model_ap_output, (list, tuple)) and len(model_ap_output) == 2:
-            pred_ap0_model_output_batch = model_ap_output[0]
-            pred_ap1_model_output_batch = model_ap_output[1]
 
         num_samples_to_vis = min(max_samples, images0.size(0), self.n_vals_plot)
         B, C, H, W = images0.shape
@@ -211,7 +202,6 @@ class ModelTrainer():
                     "pred_mask_ch": pred_masks_binary_batch[i, 0],
                     "gt_bbox_tensor": gt_bboxes0_batch[i] if gt_bboxes0_batch is not None else None,
                     "pred_bbox_tensor": pred_bboxes0_model_output_batch[i] if pred_bboxes0_model_output_batch is not None else None,
-                    "pred_ap_tensor": pred_ap0_model_output_batch[i] if pred_ap0_model_output_batch is not None else None,
                 },
                 {
                     "name": "img1",
@@ -220,7 +210,6 @@ class ModelTrainer():
                     "pred_mask_ch": pred_masks_binary_batch[i, 1],
                     "gt_bbox_tensor": gt_bboxes1_batch[i] if gt_bboxes1_batch is not None else None,
                     "pred_bbox_tensor": pred_bboxes1_model_output_batch[i] if pred_bboxes1_model_output_batch is not None else None,
-                    "pred_ap_tensor": pred_ap1_model_output_batch[i] if pred_ap1_model_output_batch is not None else None,
                 }
             ]
 
@@ -243,7 +232,6 @@ class ModelTrainer():
                 img_for_mask = item_data["img_np_orig"].copy()
                 gt_mask_ch = item_data["gt_mask_ch"]
                 pred_mask_ch = item_data["pred_mask_ch"]
-                pred_ap_coords_sample = item_data["pred_ap_tensor"]
 
                 gt_m_np = gt_mask_ch.cpu().numpy().astype(np.uint8)
                 colored_gt_mask_overlay = np.zeros_like(img_for_mask, dtype=np.uint8)
@@ -259,22 +247,6 @@ class ModelTrainer():
                 cv.putText(img_for_mask, f"IoU: {iou:.3f}", (5, 15), cv.FONT_HERSHEY_SIMPLEX,
                            font_scale, text_color, thickness)
 
-                if pred_ap_coords_sample is not None and pred_ap_coords_sample.nelement() > 0:
-                    ap_coords_np = pred_ap_coords_sample.detach().cpu().numpy().astype(np.int32)
-                    if ap_coords_np.ndim == 1 and ap_coords_np.shape[0] == 2:
-                        ap_coords_np = ap_coords_np.reshape(1, 2)
-                    elif ap_coords_np.ndim == 2 and ap_coords_np.shape[1] != 2:
-                        ap_coords_np = ap_coords_np.reshape(-1, 2)
-
-                    for pt_idx in range(ap_coords_np.shape[0]):
-                        x_ap, y_ap = ap_coords_np[pt_idx, 0], ap_coords_np[pt_idx, 1]
-                        if 0 <= x_ap < img_for_mask.shape[1] and 0 <= y_ap < img_for_mask.shape[0]:
-                            cv.circle(img_for_mask, (x_ap, y_ap), radius=3, color=anchor_color, thickness=-1)
-                        else:
-                            self.accelerator.print(
-                                f"Rank {self.accelerator.process_index}: Anchor point ({x_ap}, {y_ap}) for sample {i}, item {item_data['name']} "
-                                f"out of bounds for image shape {img_for_mask.shape[:2]}. Skipping point."
-                            )
                 vis_mask_pair.append(img_for_mask)
 
             # Create subdirectory for the current prefix (e.g., val_ds0_epoch0) if it doesn't exist

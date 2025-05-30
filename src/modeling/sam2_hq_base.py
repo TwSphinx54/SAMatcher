@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Union
 
+import torch.nn as nn
 from torch.nn.init import trunc_normal_
 
 from src.modeling.sam.prompt_encoder import PromptEncoder
@@ -208,14 +209,13 @@ class SAM2HQBase(torch.nn.Module):
             no_ker_size=[[1, 3, 5], [1, 3, 5], [1, 3, 5]]
         )
 
-        # self.prompter = LWAPP(d_model=d_model)
-        self.prompter = Prompter(
-            d_model=d_model,
-            nhead=8,
-            feat_size=self.image_size // 16,
-            no_ker_size=[1, 3, 5],
-            num_layers=2
-        )
+        self.sparse_lemb0 = nn.Embedding(1, d_model)
+        self.sparse_lemb1 = nn.Embedding(1, d_model)
+        feat_size = self.image_size // 16
+        self.dense_lemb0 = nn.Parameter(torch.zeros(1, d_model, feat_size, feat_size))
+        self.dense_lemb1 = nn.Parameter(torch.zeros(1, d_model, feat_size, feat_size))
+        trunc_normal_(self.dense_lemb0, std=0.02)
+        trunc_normal_(self.dense_lemb1, std=0.02)
 
     
     def forward(self, img0, img1) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -266,25 +266,15 @@ class SAM2HQBase(torch.nn.Module):
         emb0 = encoder_embeddings_for_decoder0.flatten(-2).permute(0, 2, 1)
         emb1 = encoder_embeddings_for_decoder1.flatten(-2).permute(0, 2, 1)
 
-        # 2. Prompt Regression - Process each image separately
         emb0, emb1 = self.fuser(emb0, emb1)
-
-        ap0, ap1, labels = self.prompter(emb0, emb1, h_emb, w_emb, h, w)
-        aps = [ap0, ap1]
-
-        # 3. Process each image through SAM decoder separately
-        # For image 0
-        sparse_embeddings_0, dense_embeddings_0 = self.sam_prompt_encoder(
-            points=(ap0, labels[:, :1]),  # Only use labels for first image
-            boxes=None,
-            masks=None
-        )
-
-        # Reshape back to original spatial format
         emb0 = emb0.permute(0, 2, 1).reshape(b_emb, c_emb, h_emb, w_emb)
         emb1 = emb1.permute(0, 2, 1).reshape(b_emb, c_emb, h_emb, w_emb)
 
-        masks0, iou_pred0, sam_tokens_out0, object_score_logits0, tlbr0 = self.sam_mask_decoder(
+        # For image 0 - use learnable embeddings
+        sparse_embeddings_0 = self.sparse_lemb0.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        dense_embeddings_0 = self.dense_lemb0.expand(batch_size, -1, -1, -1)
+
+        masks0, iou_pred0, sam_tokens_out0, object_score_logits0, bbox_pred0 = self.sam_mask_decoder(
             image_embeddings=emb0,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_0,
@@ -295,14 +285,11 @@ class SAM2HQBase(torch.nn.Module):
             hq_token_only=False
         )
 
-        # For image 1
-        sparse_embeddings_1, dense_embeddings_1 = self.sam_prompt_encoder(
-            points=(ap1, labels[:, 1:]),  # Use labels for second image
-            boxes=None,
-            masks=None
-        )
+        # For image 1 - use learnable embeddings  
+        sparse_embeddings_1 = self.sparse_lemb1.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        dense_embeddings_1 = self.dense_lemb1.expand(batch_size, -1, -1, -1)
 
-        masks1, iou_pred1, sam_tokens_out1, object_score_logits1, tlbr1 = self.sam_mask_decoder(
+        masks1, iou_pred1, sam_tokens_out1, object_score_logits1, bbox_pred1 = self.sam_mask_decoder(
             image_embeddings=emb1,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_1,
@@ -315,45 +302,11 @@ class SAM2HQBase(torch.nn.Module):
 
         # Combine masks from both images
         masks = torch.cat([masks0, masks1], dim=1)  # Shape: (B, 2, H, W)
+        bbox_pred0 = bbox_pred0 * torch.tensor([w, h, w, h], device=bbox_pred0.device)
+        bbox_pred1 = bbox_pred1 * torch.tensor([w, h, w, h], device=bbox_pred1.device)
+        boxes = (bbox_pred0, bbox_pred1)
 
-        boxes = self.obtain_overlap_bbox(ap0.squeeze(1), tlbr0, ap1.squeeze(1), tlbr1, h, w, h, w)
-
-        return masks, aps, boxes
-
-    def obtain_overlap_bbox(self, box_cxy1, tlbr1, box_cxy2, tlbr2, h1, w1, h2, w2):
-        pred_bbox_xyxy1 = torch.stack(
-            [
-                box_cxy1[:, 0] - tlbr1[:, 1] * w1,
-                box_cxy1[:, 1] - tlbr1[:, 0] * h1,
-                box_cxy1[:, 0] + tlbr1[:, 3] * w1,
-                box_cxy1[:, 1] + tlbr1[:, 2] * h1,
-            ],
-            dim=1,
-        )
-        pred_bbox_xyxy2 = torch.stack(
-            [
-                box_cxy2[:, 0] - tlbr2[:, 1] * w2,
-                box_cxy2[:, 1] - tlbr2[:, 0] * h2,
-                box_cxy2[:, 0] + tlbr2[:, 3] * w2,
-                box_cxy2[:, 1] + tlbr2[:, 2] * h2,
-            ],
-            dim=1,
-        )
-        pred_bbox_cxywh1 = torch.cat(
-            [
-                (pred_bbox_xyxy1[:, :2] + pred_bbox_xyxy1[:, 2:]) / 2,
-                pred_bbox_xyxy1[:, 2:] - pred_bbox_xyxy1[:, :2],
-            ],
-            dim=-1,
-        )
-        pred_bbox_cxywh2 = torch.cat(
-            [
-                (pred_bbox_xyxy2[:, :2] + pred_bbox_xyxy2[:, 2:]) / 2,
-                pred_bbox_xyxy2[:, 2:] - pred_bbox_xyxy2[:, :2],
-            ],
-            dim=-1,
-        )
-        return pred_bbox_xyxy1, pred_bbox_xyxy2, pred_bbox_cxywh1, pred_bbox_cxywh2
+        return masks, boxes
 
     @property
     def device(self):
