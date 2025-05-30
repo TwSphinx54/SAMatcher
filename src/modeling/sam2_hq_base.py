@@ -280,8 +280,12 @@ class SAM2HQBase(torch.nn.Module):
             masks=None
         )
 
+        # Reshape back to original spatial format
+        emb0 = emb0.permute(0, 2, 1).reshape(b_emb, c_emb, h_emb, w_emb)
+        emb1 = emb1.permute(0, 2, 1).reshape(b_emb, c_emb, h_emb, w_emb)
+
         masks0, iou_pred0, sam_tokens_out0, object_score_logits0, tlbr0 = self.sam_mask_decoder(
-            image_embeddings=encoder_embeddings_for_decoder0,
+            image_embeddings=emb0,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_0,
             dense_prompt_embeddings=dense_embeddings_0,
@@ -299,7 +303,7 @@ class SAM2HQBase(torch.nn.Module):
         )
 
         masks1, iou_pred1, sam_tokens_out1, object_score_logits1, tlbr1 = self.sam_mask_decoder(
-            image_embeddings=encoder_embeddings_for_decoder1,
+            image_embeddings=emb1,
             image_pe=image_pe_for_decoder,
             sparse_prompt_embeddings=sparse_embeddings_1,
             dense_prompt_embeddings=dense_embeddings_1,
