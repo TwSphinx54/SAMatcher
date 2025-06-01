@@ -14,9 +14,10 @@ from torch.nn.init import trunc_normal_
 from src.modeling.sam.prompt_encoder import PromptEncoder
 from src.modeling.sam.mask_hq_decoder import MaskDecoderHQ
 from src.modeling.sam.transformer import TwoWayTransformer
-from src.modeling.prompter.transformer import TransformerFuser
+# from src.modeling.prompter.transformer import TransformerFuser
 # from src.modeling.prompter.lwapp import LWAPP
 from src.modeling.prompter.prompter import Prompter
+from src.modeling.prompter.SwinV2_CCT import SwinTransformerV2_CCT
 from src.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
 # a large negative value as a placeholder score for missing objects
@@ -200,13 +201,21 @@ class SAM2HQBase(torch.nn.Module):
 
         d_model = self.sam_prompt_encoder.embed_dim
 
-        self.fuser = TransformerFuser(
-            feat_size=self.image_size // 16,
+        # Replace TransformerFuser with SwinTransformerV2_CCT
+        self.fuser = SwinTransformerV2_CCT(
+            feat_size=self.image_size // 16,  # 64x64 for 1024x1024 image
             feat_chan=d_model,
-            depths=[2, 2, 2],
-            num_heads=[8, 8, 8],
-            msa_sizes=[[3, 5, 7], [3, 5, 7]],
-            no_ker_size=[[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+            double_depths=[2, 2],             # D×2 + D×2 for correlation
+            single_depths=[2, 1],             # S×2 + S×1 for independent processing
+            num_heads=[8, 16, 32, 64],        # Progressive attention heads
+            window_size=8,                    # 8x8 window for 1024x1024 feature map
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.1,
+            attn_drop_rate=0.1,
+            drop_path_rate=0.1,
+            double_attn_type='cosine',        # Best for correlation tasks
+            single_attn_type='flash'          # Efficient for independent processing
         )
 
         self.sparse_lemb0 = nn.Embedding(1, d_model)

@@ -4,6 +4,7 @@ import pprint
 import argparse
 import warnings
 import time # Ensure time is imported
+import os
 from pathlib import Path
 from src.build_model import ModelTrainer
 from src.build_samatcher import build_samatcher
@@ -42,6 +43,7 @@ def parse_args():
     parser.add_argument('--save_every_n_epochs', type=int, default=5, help='Save checkpoint every N epochs.')
     parser.add_argument('--wandb_entity', type=str, default=None, help="Weights & Biases entity name (username or team name).")
     parser.add_argument('--wandb_project', type=str, default=None, help="Weights & Biases project name (overrides exp_name for W&B).")
+    parser.add_argument('--wandb_offline', action='store_true', help='Run Weights & Biases in offline mode for poor network conditions.')
 
     parser.add_argument('--profiler_name', type=str, default=None, help='Profiler to use (e.g., "pytorch", "inference"). Leave None to disable.')
 
@@ -52,6 +54,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # --- Configure Weights & Biases offline mode ---
+    if args.wandb_offline:
+        os.environ["WANDB_MODE"] = "offline"
+        loguru_logger.info("Weights & Biases set to offline mode")
 
     # --- Initialize Accelerator and set seed ---
     accelerator = Accelerator(
@@ -83,6 +90,10 @@ def main():
         init_kwargs = {"wandb": {"name": custom_run_name}}
         if args.wandb_entity:
             init_kwargs["wandb"]["entity"] = args.wandb_entity
+        
+        # Add offline mode configuration
+        if args.wandb_offline:
+            init_kwargs["wandb"]["mode"] = "offline"
 
         # Accelerator's project_dir is args.output_dir. W&B will create its own subfolder there.
         accelerator.init_trackers(project_name=wandb_project_name, config=vars(args), init_kwargs=init_kwargs)
@@ -255,8 +266,7 @@ def main():
 
             # Step-wise learning rate scheduler (if configured and gradients were synchronized)
             if scheduler is not None and scheduler['interval'] == 'step' and accelerator.sync_gradients:
-                 unwrapped_scheduler = accelerator.unwrap_model(scheduler['scheduler'])
-                 unwrapped_scheduler.step()
+                 scheduler['scheduler'].step()
 
             # Log training metrics (on main process only)
             if total_steps > 0 and total_steps % args.log_every_n_steps == 0 and accelerator.is_main_process:
@@ -290,8 +300,7 @@ def main():
 
         # End of epoch scheduler step (if configured)
         if scheduler is not None and scheduler['interval'] == 'epoch':
-            unwrapped_scheduler = accelerator.unwrap_model(scheduler['scheduler'])
-            unwrapped_scheduler.step()
+            scheduler['scheduler'].step()
 
         # --- Validation Phase ---
         if epoch % args.val_every_n_epochs == 0:

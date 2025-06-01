@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+nohup.out
 
 # Virtual environments
 .venv
@@ -17,3 +18,4 @@ checkpoints/
 outputs/
 pretrained_checkpoint/
 wandb/
+data/
