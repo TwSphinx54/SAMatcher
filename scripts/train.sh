@@ -1,10 +1,10 @@
 accelerate launch --config_file configs/accelerate_config.yaml --num_processes 2 train.py \
     --data_cfg_path configs/train_config.py \
     --exp_name SAMatcher \
-    --batch_size 16 \
-    --val_batch_size 16 \
+    --batch_size 8 \
+    --val_batch_size 8 \
     --num_workers 8 \
-    --true_lr 0.001 \
+    --true_lr 1e-4 \
     --num_epochs 60 \
     --log_every_n_steps 5 \
     --output_dir outputs \

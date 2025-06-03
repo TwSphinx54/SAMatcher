@@ -205,8 +205,8 @@ class SAM2HQBase(torch.nn.Module):
         self.fuser = SwinTransformerV2_CCT(
             feat_size=self.image_size // 16,  # 64x64 for 1024x1024 image
             feat_chan=d_model,
-            double_depths=[2, 2],             # D×2 + D×2 for correlation
-            single_depths=[2, 1],             # S×2 + S×1 for independent processing
+            double_depths=[4, 4],             # D×2 + D×2 for correlation
+            single_depths=[4, 2],             # S×2 + S×1 for independent processing
             num_heads=[8, 16, 32, 64],        # Progressive attention heads
             window_size=8,                    # 8x8 window for 1024x1024 feature map
             mlp_ratio=4.0,

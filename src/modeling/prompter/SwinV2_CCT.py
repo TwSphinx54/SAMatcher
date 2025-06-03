@@ -24,7 +24,7 @@ def _init_weights(m):
 
 
 class RoPEPositionalEncoding(nn.Module):
-    """Rotary Position Embedding (RoPE)"""
+    """Rotary Position Embedding for enhanced position awareness in attention"""
     
     def __init__(self, dim, max_seq_len=10000):
         super().__init__()
@@ -43,7 +43,7 @@ class RoPEPositionalEncoding(nn.Module):
         return emb
     
     def apply_rope(self, x, rope_cache):
-        """Apply RoPE to input tensor x
+        """Apply RoPE rotation to query/key tensors
         Args:
             x: (B_, num_heads, seq_len, head_dim) - query or key tensor
             rope_cache: (seq_len, head_dim) - precomputed rope encoding
@@ -92,13 +92,7 @@ class Mlp(nn.Module):
 
 
 def window_partition(x, window_size):
-    """
-    Args:
-        x: (B, H, W, C)
-        window_size (int): window size
-    Returns:
-        windows: (num_windows*B, window_size, window_size, C)
-    """
+    """Partition into non-overlapping windows"""
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
@@ -106,15 +100,7 @@ def window_partition(x, window_size):
 
 
 def window_reverse(windows, window_size, H, W):
-    """
-    Args:
-        windows: (num_windows*B, window_size, window_size, C)
-        window_size (int): Window size
-        H (int): Height of image
-        W (int): Width of image
-    Returns:
-        x: (B, H, W, C)
-    """
+    """Reverse window partition to original spatial layout"""
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
@@ -122,7 +108,7 @@ def window_reverse(windows, window_size, H, W):
 
 
 class WindowAttentionWithRoPE(nn.Module):
-    """Window based multi-head self attention with RoPE and multiple attention choices"""
+    """Window-based multi-head attention with RoPE and multiple attention variants"""
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0., 
                  attn_type='flash'):
@@ -135,7 +121,7 @@ class WindowAttentionWithRoPE(nn.Module):
         self.head_dim = head_dim
         self.attn_type = attn_type
 
-        # Validate attention type
+        # Fallback if flash attention unavailable
         if attn_type == 'flash' and not FLASH_ATTN_AVAILABLE:
             print("Flash Attention not available, falling back to cosine attention")
             self.attn_type = 'cosine'
@@ -148,7 +134,7 @@ class WindowAttentionWithRoPE(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         
-        # For cosine attention
+        # Learnable scale for cosine attention
         if self.attn_type == 'cosine':
             self.logit_scale = nn.Parameter(torch.log(10 * torch.ones((num_heads, 1, 1))), requires_grad=True)
         
@@ -172,12 +158,14 @@ class WindowAttentionWithRoPE(nn.Module):
         if self.attn_type == 'flash' and mask is None:
             # Flash Attention 2.0 - most efficient for long sequences
             # Reshape for flash attention: (B_, N, num_heads, head_dim)
-            q = q.transpose(1, 2)  # B_, N, num_heads, head_dim
+            q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             
-            x = flash_attn_func(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-            x = x.reshape(B_, N, C)
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                x = flash_attn_func(q.half(), k.half(), v.half(), 
+                                   dropout_p=self.attn_drop.p if self.training else 0.0)
+            x = x.float().reshape(B_, N, C)
             
         elif self.attn_type == 'cosine':
             # Cosine Attention - better for correlation tasks
@@ -225,82 +213,8 @@ class WindowAttentionWithRoPE(nn.Module):
         return x
 
 
-class CrossModalAttention(nn.Module):
-    """Cross-modal attention specifically designed for dual-view correlation"""
-    
-    def __init__(self, dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.head_dim = head_dim
-
-        # Separate projections for each modality
-        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        
-        # Cross-modal mixing
-        self.cross_attn_scale = nn.Parameter(torch.ones(1) * 0.5)
-        
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x1, x2):
-        """
-        Args:
-            x1: (B, N, C) - first modality
-            x2: (B, N, C) - second modality  
-        Returns:
-            out1: (B, N, C) - enhanced first modality
-            out2: (B, N, C) - enhanced second modality
-        """
-        B, N, C = x1.shape
-        
-        # Project to q, k, v
-        q1 = self.q_proj(x1).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k1 = self.k_proj(x1).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v1 = self.v_proj(x1).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        
-        q2 = self.q_proj(x2).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k2 = self.k_proj(x2).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v2 = self.v_proj(x2).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        
-        # Self-attention
-        attn11 = (q1 @ k1.transpose(-2, -1)) * self.scale
-        attn22 = (q2 @ k2.transpose(-2, -1)) * self.scale
-        
-        # Cross-attention  
-        attn12 = (q1 @ k2.transpose(-2, -1)) * self.scale
-        attn21 = (q2 @ k1.transpose(-2, -1)) * self.scale
-        
-        # Mix self and cross attention
-        attn1 = (1 - self.cross_attn_scale) * attn11 + self.cross_attn_scale * attn12
-        attn2 = (1 - self.cross_attn_scale) * attn22 + self.cross_attn_scale * attn21
-        
-        attn1 = self.softmax(attn1)
-        attn2 = self.softmax(attn2)
-        
-        attn1 = self.attn_drop(attn1)
-        attn2 = self.attn_drop(attn2)
-        
-        # Apply attention
-        out1 = (attn1 @ v1).transpose(1, 2).reshape(B, N, C)
-        out2 = (attn2 @ v2).transpose(1, 2).reshape(B, N, C)
-        
-        out1 = self.proj(out1)
-        out2 = self.proj(out2)
-        out1 = self.proj_drop(out1)
-        out2 = self.proj_drop(out2)
-        
-        return out1, out2
-
-
 class DoubleBlock(nn.Module):
-    """Double Block - processes concatenated features from both views"""
+    """Processes concatenated features from both views for cross-view interaction"""
     
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
@@ -329,7 +243,7 @@ class DoubleBlock(nn.Module):
         mlp_hidden_dim = int(dim * 2 * mlp_ratio)
         self.mlp = Mlp(in_features=dim * 2, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-        # Attention mask for shifted window
+        # Create attention mask for shifted windows
         if self.shift_size > 0:
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))
@@ -355,25 +269,19 @@ class DoubleBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x0, x1):
-        """
-        Args:
-            x0: (B, L, C) - first view
-            x1: (B, L, C) - second view
-        Returns:
-            x_concat: (B, L, 2*C) - concatenated and processed features
-        """
+        """Concatenate and process both views together"""
         H, W = self.input_resolution
         B, L, C = x0.shape
         assert L == H * W, "input feature has wrong size"
 
-        # Concatenate along channel dimension (dim=-1)
+        # Concatenate along channel dimension
         x_concat = torch.cat([x0, x1], dim=-1)  # (B, L, 2*C) ✓ 正确：沿channel维度拼接
         
         shortcut = x_concat
         x_concat = self.norm1(x_concat)
         x_concat = x_concat.view(B, H, W, 2*C)
 
-        # Cyclic shift
+        # Shifted window attention
         if self.shift_size > 0:
             shifted_x = torch.roll(x_concat, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
@@ -397,7 +305,7 @@ class DoubleBlock(nn.Module):
             x_concat = shifted_x
         x_concat = x_concat.view(B, H * W, 2*C)
 
-        # FFN
+        # Residual connection and MLP
         x_concat = shortcut + self.drop_path(x_concat)
         x_concat = x_concat + self.drop_path(self.mlp(self.norm2(x_concat)))
 
@@ -405,7 +313,7 @@ class DoubleBlock(nn.Module):
 
 
 class SingleBlock(nn.Module):
-    """Single Block - processes each view independently after splitting"""
+    """Processes each view independently for view-specific features"""
     
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
@@ -433,7 +341,7 @@ class SingleBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-        # Attention mask for shifted window
+        # Create attention mask for shifted windows
         if self.shift_size > 0:
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))
@@ -459,7 +367,7 @@ class SingleBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x):
-        """Process single view with self-attention and RoPE"""
+        """Process single view with self-attention"""
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -468,7 +376,7 @@ class SingleBlock(nn.Module):
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
-        # Cyclic shift
+        # Shifted window attention
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
@@ -492,7 +400,7 @@ class SingleBlock(nn.Module):
             x = shifted_x
         x = x.view(B, H * W, C)
 
-        # FFN
+        # Residual connection and MLP
         x = shortcut + self.drop_path(x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
@@ -500,21 +408,9 @@ class SingleBlock(nn.Module):
 
 
 class SwinTransformerV2_CCT(nn.Module):
-    r""" Swin Transformer V2 with D×N + S×M architecture for dual input processing.
+    """Swin Transformer V2 with D×N + S×M architecture for dual-view processing
     
-    Args:
-        feat_size (int): Input feature size. Default 40
-        feat_chan (int): Number of input feature channels. Default: 256
-        double_depths (tuple(int)): Depth of each Double layer (D×N).
-        single_depths (tuple(int): Depth of each Single layer (S×M).
-        num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
-        drop_rate (float): Dropout rate. Default: 0
-        attn_drop_rate (float): Attention dropout rate. Default: 0
-        drop_path_rate (float): Stochastic depth rate. Default: 0.1
-        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+    Architecture: D×N Double blocks for cross-view interaction + S×M Single blocks for view-specific processing
     """
 
     def __init__(self, feat_size=40, feat_chan=256, double_depths=[2, 2], single_depths=[6, 2], 
@@ -527,15 +423,14 @@ class SwinTransformerV2_CCT(nn.Module):
         self.feat_chan = feat_chan
         self.flat_len = feat_size * feat_size
         
-        # Total layers: D×N + S×M
+        # Calculate total blocks for stochastic depth scheduling
         total_double_blocks = sum(double_depths)
         total_single_blocks = sum(single_depths)
         total_blocks = total_double_blocks + total_single_blocks
 
-        # Stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_blocks)]
 
-        # Build Double layers (D×N)
+        # Build Double layers for cross-view interaction
         self.double_layers = nn.ModuleList()
         block_idx = 0
         for i, depth in enumerate(double_depths):
@@ -558,7 +453,7 @@ class SwinTransformerV2_CCT(nn.Module):
                 block_idx += 1
             self.double_layers.append(layer_blocks)
 
-        # Build Single layers (S×M)
+        # Build Single layers for view-specific processing
         self.single_layers = nn.ModuleList()
         for i, depth in enumerate(single_depths):
             layer_blocks = nn.ModuleList()
@@ -583,48 +478,33 @@ class SwinTransformerV2_CCT(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, x0, x1):
-        """
-        Args:
-            x0: (B, L, C) where L = H * W - first view
-            x1: (B, L, C) where L = H * W - second view
-        Returns:
-            x0: (B, L, C) - processed first view
-            x1: (B, L, C) - processed second view
-        """
-        # Ensure input shapes are preserved
+        """Forward pass through D×N + S×M architecture"""
         B, L, C = x0.shape
         assert x1.shape == (B, L, C), f"Input shapes must match: x0={x0.shape}, x1={x1.shape}"
         assert L == self.flat_len, f"Input length {L} must match expected {self.flat_len}"
         assert C == self.feat_chan, f"Input channels {C} must match expected {self.feat_chan}"
 
-        # Phase 1: Double layers (D×N) - concatenated processing
+        # Phase 1: Double layers - cross-view interaction
         x_concat = None
         for layer_blocks in self.double_layers:
             if x_concat is None:
-                # First double layer: concatenate inputs and process
+                # First double layer: concatenate inputs
                 for block in layer_blocks:
-                    x_concat = block(x0, x1)  # x_concat shape: (B, L, 2*C)
+                    x_concat = block(x0, x1)
             else:
-                # Subsequent double layers: process concatenated features
+                # Subsequent layers: process concatenated features
                 for block in layer_blocks:
-                    # Split along channel dimension (dim=-1) to get original C channels each
-                    x0_temp, x1_temp = torch.chunk(x_concat, 2, dim=-1)  # ✓ 正确：在channel维度split
-                    # x0_temp: (B, L, C), x1_temp: (B, L, C)
-                    x_concat = block(x0_temp, x1_temp)  # 重新拼接得到 (B, L, 2*C)
+                    x0_temp, x1_temp = torch.chunk(x_concat, 2, dim=-1)
+                    x_concat = block(x0_temp, x1_temp)
 
-        # Phase 2: Single layers (S×M) - independent processing
+        # Phase 2: Single layers - view-specific processing
         if x_concat is not None:
             # Split concatenated features back to individual views
-            x0, x1 = torch.chunk(x_concat, 2, dim=-1)  # ✓ 正确：在channel维度split
-            # x0: (B, L, C), x1: (B, L, C)
+            x0, x1 = torch.chunk(x_concat, 2, dim=-1)
         
         for layer_blocks in self.single_layers:
             for block in layer_blocks:
-                x0 = block(x0)  # 独立处理每个view
+                x0 = block(x0)
                 x1 = block(x1)
 
-        # Ensure output shapes are preserved
-        assert x0.shape == (B, L, C), f"Output x0 shape changed: expected {(B, L, C)}, got {x0.shape}"
-        assert x1.shape == (B, L, C), f"Output x1 shape changed: expected {(B, L, C)}, got {x1.shape}"
-        
         return x0, x1
