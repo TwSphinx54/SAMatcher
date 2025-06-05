@@ -17,7 +17,7 @@ from src.modeling.sam.transformer import TwoWayTransformer
 # from src.modeling.prompter.transformer import TransformerFuser
 # from src.modeling.prompter.lwapp import LWAPP
 from src.modeling.prompter.prompter import Prompter
-from src.modeling.prompter.SwinV2_CCT import SwinTransformerV2_CCT
+from src.modeling.prompter.symswinfuser import SymSwinFuser
 from src.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
 # a large negative value as a placeholder score for missing objects
@@ -201,8 +201,8 @@ class SAM2HQBase(torch.nn.Module):
 
         d_model = self.sam_prompt_encoder.embed_dim
 
-        # Replace TransformerFuser with SwinTransformerV2_CCT
-        self.fuser = SwinTransformerV2_CCT(
+        # Replace TransformerFuser with SymmetricSwinTransformerV2
+        self.fuser = SymSwinFuser(
             feat_size=self.image_size // 16,  # 64x64 for 1024x1024 image
             feat_chan=d_model,
             double_depths=[4, 4],             # D×2 + D×2 for correlation

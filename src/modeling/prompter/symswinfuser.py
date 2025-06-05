@@ -407,7 +407,7 @@ class SingleBlock(nn.Module):
         return x
 
 
-class SwinTransformerV2_CCT(nn.Module):
+class SymSwinFuser(nn.Module):
     """Swin Transformer V2 with D×N + S×M architecture for dual-view processing
     
     Architecture: D×N Double blocks for cross-view interaction + S×M Single blocks for view-specific processing
