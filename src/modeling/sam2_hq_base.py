@@ -204,6 +204,7 @@ class SAM2HQBase(torch.nn.Module):
         # Replace TransformerFuser with SymmetricSwinTransformerV2
         self.fuser = SymSwinFuser(
             feat_size=self.image_size // 16,  # 64x64 for 1024x1024 image
+            # self.backbone_stride?
             feat_chan=d_model,
             double_depths=[4, 4],             # D×2 + D×2 for correlation
             single_depths=[4, 2],             # S×2 + S×1 for independent processing

@@ -221,7 +221,8 @@ class DoubleBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_type='cosine'):
         super().__init__()
         self.dim = dim
-        self.input_resolution = input_resolution
+        # Double the height to accommodate concatenated sequences
+        self.input_resolution = (input_resolution[0] * 2, input_resolution[1])
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
@@ -232,16 +233,16 @@ class DoubleBlock(nn.Module):
             self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window-size"
 
-        # Process concatenated features (2*dim)
-        self.norm1 = norm_layer(dim * 2)
+        # Process concatenated features (same dim, double length)
+        self.norm1 = norm_layer(dim)
         self.attn = WindowAttentionWithRoPE(
-            dim * 2, window_size=(self.window_size, self.window_size), num_heads=num_heads,
+            dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, attn_type=attn_type)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim * 2)
-        mlp_hidden_dim = int(dim * 2 * mlp_ratio)
-        self.mlp = Mlp(in_features=dim * 2, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         # Create attention mask for shifted windows
         if self.shift_size > 0:
@@ -269,17 +270,17 @@ class DoubleBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x0, x1):
-        """Concatenate and process both views together"""
+        """Concatenate along sequence dimension and process together"""
         H, W = self.input_resolution
+        original_H = H // 2  # Original height before concatenation
         B, L, C = x0.shape
-        assert L == H * W, "input feature has wrong size"
+        assert L == original_H * W, "input feature has wrong size"
 
-        # Concatenate along channel dimension
-        x_concat = torch.cat([x0, x1], dim=-1)  # (B, L, 2*C) ✓ 正确：沿channel维度拼接
-        
+        # Concatenate along sequence dimension (L dimension)
+        x_concat = torch.cat([x0, x1], dim=1)  # (B, 2*L, C)
         shortcut = x_concat
         x_concat = self.norm1(x_concat)
-        x_concat = x_concat.view(B, H, W, 2*C)
+        x_concat = x_concat.view(B, H, W, C)  # H = 2 * original_H
 
         # Shifted window attention
         if self.shift_size > 0:
@@ -289,13 +290,13 @@ class DoubleBlock(nn.Module):
 
         # Partition windows
         x_windows = window_partition(shifted_x, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, 2*C)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=self.attn_mask)
 
         # Merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, 2*C)
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, H, W)
 
         # Reverse cyclic shift
@@ -303,7 +304,7 @@ class DoubleBlock(nn.Module):
             x_concat = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x_concat = shifted_x
-        x_concat = x_concat.view(B, H * W, 2*C)
+        x_concat = x_concat.view(B, H * W, C)  # (B, 2*L, C)
 
         # Residual connection and MLP
         x_concat = shortcut + self.drop_path(x_concat)
@@ -485,22 +486,21 @@ class SymSwinFuser(nn.Module):
         assert C == self.feat_chan, f"Input channels {C} must match expected {self.feat_chan}"
 
         # Phase 1: Double layers - cross-view interaction
-        x_concat = None
-        for layer_blocks in self.double_layers:
-            if x_concat is None:
-                # First double layer: concatenate inputs
+        for i, layer_blocks in enumerate(self.double_layers):
+            if i == 0:
+                # First double layer: process individual views and concatenate in L dimension
                 for block in layer_blocks:
-                    x_concat = block(x0, x1)
+                    x_concat = block(x0, x1)  # Returns (B, 2*L, C)
             else:
-                # Subsequent layers: process concatenated features
+                # Subsequent double layers: split and re-process
                 for block in layer_blocks:
-                    x0_temp, x1_temp = torch.chunk(x_concat, 2, dim=-1)
+                    x0_temp, x1_temp = torch.chunk(x_concat, 2, dim=1)  # Split along L dimension
                     x_concat = block(x0_temp, x1_temp)
 
         # Phase 2: Single layers - view-specific processing
-        if x_concat is not None:
-            # Split concatenated features back to individual views
-            x0, x1 = torch.chunk(x_concat, 2, dim=-1)
+        if len(self.double_layers) > 0:
+            # Split concatenated features back to individual views along L dimension
+            x0, x1 = torch.chunk(x_concat, 2, dim=1)
         
         for layer_blocks in self.single_layers:
             for block in layer_blocks:

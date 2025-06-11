@@ -12,6 +12,9 @@ nohup.out
 .vscode
 .cache
 .ropeproject
+uv.lock
+pyproject.toml
+.python-version
 
 # Others
 checkpoints/
@@ -19,3 +22,4 @@ outputs/
 pretrained_checkpoint/
 wandb/
 data/
+weights/
