@@ -4,11 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
 import math
 import warnings
 from functools import partial
 from typing import Tuple, Type
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -242,6 +242,43 @@ class Attention(nn.Module):
 
         self.dropout_p = dropout
 
+        # Flash Attention compatibility detection
+        self._mixed_precision_enabled = False
+        self._flash_attn_available = self._check_flash_attn_availability()
+
+    def _check_flash_attn_availability(self):
+        """Check if Flash Attention is available"""
+        try:
+            import flash_attn
+
+            return True
+        except ImportError:
+            return False
+
+    @contextmanager
+    def _flash_attn_context(self, q, k, v):
+        """Context manager for Flash Attention compatibility"""
+        original_dtypes = (q.dtype, k.dtype, v.dtype)
+        converted = False
+
+        # Auto-detect mixed precision from input tensors
+        if any(t.dtype in [torch.float16, torch.bfloat16] for t in [q, k, v]):
+            self._mixed_precision_enabled = True
+            target_dtype = q.dtype if q.dtype in [torch.float16, torch.bfloat16] else torch.float16
+
+            # Ensure all tensors have same dtype for Flash Attention
+            if not all(t.dtype == target_dtype for t in [q, k, v]):
+                q = q.to(target_dtype) if q.dtype != target_dtype else q
+                k = k.to(target_dtype) if k.dtype != target_dtype else k
+                v = v.to(target_dtype) if v.dtype != target_dtype else v
+                converted = True
+
+        try:
+            yield q, k, v
+        finally:
+            # No need to convert back as the computation is done
+            pass
+
     def _separate_heads(self, x: Tensor, num_heads: int) -> Tensor:
         b, n, c = x.shape
         x = x.reshape(b, n, num_heads, c // num_heads)
@@ -264,22 +301,23 @@ class Attention(nn.Module):
         v = self._separate_heads(v, self.num_heads)
 
         dropout_p = self.dropout_p if self.training else 0.0
-        # Attention
-        try:
-            with sdp_kernel_context(dropout_p):
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        except Exception as e:
-            # Fall back to all kernels if the Flash attention kernel fails
-            warnings.warn(
-                f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-                f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-                category=UserWarning,
-                stacklevel=2,
-            )
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
+        # Flash Attention with automatic dtype handling
+        with self._flash_attn_context(q, k, v) as (q_ctx, k_ctx, v_ctx):
+            try:
+                out = F.scaled_dot_product_attention(
+                    q_ctx, k_ctx, v_ctx, dropout_p=dropout_p
+                )
+            except Exception as e:
+                # Fallback to standard attention
+                warnings.warn(
+                    f"Flash Attention failed: {e}. Falling back to standard attention.",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                out = self._standard_attention(q, k, v, dropout_p)
+
+        # Recombine heads and project output
         out = self._recombine_heads(out)
         out = self.out_proj(out)
 

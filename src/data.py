@@ -93,9 +93,14 @@ class MultiSceneDataModule:
 
     def _setup_datasets(self):
         """Setup train/val/test datasets."""
-        # Using accelerator's properties directly
-        self.world_size = self.accelerator.num_processes
-        self.rank = self.accelerator.process_index
+        # Handle debug mode where accelerator might be None
+        if self.accelerator is not None:
+            self.world_size = self.accelerator.num_processes
+            self.rank = self.accelerator.process_index
+        else:
+            # Debug mode fallbacks
+            self.world_size = 1
+            self.rank = 0
         
         logger.info(f"[rank:{self.rank}/{self.world_size}] Setting up datasets...")
 
@@ -181,8 +186,21 @@ class MultiSceneDataModule:
         if dataset is None:
              logger.warning("Dataset is None, cannot create DataLoader.")
              return None
-        sampler = DistributedSampler(dataset, shuffle=shuffle, seed=self.seed, drop_last=drop_last, rank=self.accelerator.process_index, num_replicas=self.accelerator.num_processes)
-        return DataLoader(dataset, sampler=sampler, **loader_params, drop_last=drop_last, collate_fn=collate_fn_skip_none)
+        
+        # Handle debug mode where accelerator might be None
+        if self.accelerator is not None:
+            sampler = DistributedSampler(
+                dataset, 
+                shuffle=shuffle, 
+                seed=self.seed, 
+                drop_last=drop_last, 
+                rank=self.accelerator.process_index, 
+                num_replicas=self.accelerator.num_processes
+            )
+            return DataLoader(dataset, sampler=sampler, **loader_params, drop_last=drop_last, collate_fn=collate_fn_skip_none)
+        else:
+            # Debug mode: use simple DataLoader without DistributedSampler
+            return DataLoader(dataset, **loader_params, drop_last=drop_last, collate_fn=collate_fn_skip_none)
 
     def train_dataloader(self):
         logger.info(f'[rank:{self.rank}/{self.world_size}] Creating training DataLoader.')

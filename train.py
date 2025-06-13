@@ -49,11 +49,138 @@ def parse_args():
 
     # Add val_batch_size to args if not present, for MultiSceneDataModule
     parser.add_argument('--val_batch_size', type=int, default=2, help='Batch size for validation and testing per GPU.')
+    
+    # Add debug mode flag
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode for single GPU without Accelerator and WandB.')
 
     return parser.parse_args()
 
 def main():
     args = parse_args()
+
+    # --- Debug Mode Setup ---
+    if args.debug:
+        loguru_logger.info("Running in DEBUG mode - single GPU, no Accelerator, no WandB")
+        
+        # Set device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        loguru_logger.info(f"Using device: {device}")
+        
+        # Set seed
+        set_seed(args.seed)
+        
+        # Simple output directory
+        current_time_str = time.strftime("%Y%m%d-%H%M%S")
+        run_specific_output_dir = Path(args.output_dir) / args.exp_name / f"debug_{current_time_str}"
+        run_specific_output_dir.mkdir(parents=True, exist_ok=True)
+        loguru_logger.info(f"Debug output directory: {run_specific_output_dir}")
+        
+        # Load config
+        config = get_cfg_defaults()
+        config.merge_from_file(args.data_cfg_path)
+        
+        # Simple config setup for debug
+        config.TRAINER.WORLD_SIZE = 1
+        config.TRAINER.TRUE_BATCH_SIZE = args.batch_size
+        config.TRAINER.TRUE_LR = args.true_lr
+        config.TRAINER.WARMUP_STEP = 0  # Disable warmup in debug mode
+        
+        # Create data module without accelerator
+        data_module = MultiSceneDataModule(args, config, None)  # Pass None for accelerator
+        train_dataloader = data_module.train_dataloader()
+        val_dataloader = data_module.val_dataloader()
+        
+        # Build model
+        sam_model = build_samatcher(args.sam_cfg, args.sam_checkpoint)
+        sam_model = sam_model.to(device)
+        
+        # Create model handler
+        model_handler = ModelTrainer(
+            config,
+            sam_model=sam_model,
+            pretrained_ckpt=args.ckpt_path,
+            profiler=None,  # Disable profiler in debug
+            accelerator=None,  # No accelerator
+            dump_dir=str(run_specific_output_dir / "visualizations")
+        )
+        model = model_handler.model
+        
+        # Simple optimizer setup
+        optimizer_params = filter(lambda p: p.requires_grad, model.parameters())
+        optimizer = build_optimizer(optimizer_params, config)
+        scheduler = build_scheduler(config, optimizer)
+        
+        # Debug training loop
+        loguru_logger.info(f"Starting DEBUG training for {args.num_epochs} epochs.")
+        
+        for epoch in range(args.num_epochs):
+            model.train()
+            
+            for step, batch in enumerate(train_dataloader):
+                if batch is None:
+                    continue
+                
+                # Move batch to device
+                if isinstance(batch, dict):
+                    for key, value in batch.items():
+                        if isinstance(value, torch.Tensor):
+                            batch[key] = value.to(device)
+                
+                # Forward pass
+                model_handler._trainval_inference(batch)
+                loss = batch['loss']
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping
+                if config.TRAINER.GRADIENT_CLIPPING > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAINER.GRADIENT_CLIPPING)
+                
+                optimizer.step()
+                
+                # Simple logging
+                if step % args.log_every_n_steps == 0:
+                    loguru_logger.info(f"DEBUG - Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}")
+                
+                # Break early in debug mode for faster iteration
+                if step >= 10:  # Only run 10 steps per epoch in debug
+                    break
+            
+            # Step scheduler
+            if scheduler is not None and scheduler['interval'] == 'epoch':
+                scheduler['scheduler'].step()
+            
+            # Simple validation in debug mode
+            if epoch % args.val_every_n_epochs == 0:
+                model.eval()
+                val_losses = []
+                
+                with torch.no_grad():
+                    for val_step, val_batch in enumerate(val_dataloader):
+                        if val_batch is None:
+                            continue
+                        
+                        # Move batch to device
+                        if isinstance(val_batch, dict):
+                            for key, value in val_batch.items():
+                                if isinstance(value, torch.Tensor):
+                                    val_batch[key] = value.to(device)
+                        
+                        model_handler._trainval_inference(val_batch)
+                        val_losses.append(val_batch['loss'].item())
+                        
+                        # Break early in debug mode
+                        if val_step >= 5:  # Only run 5 validation steps
+                            break
+                
+                if val_losses:
+                    avg_val_loss = sum(val_losses) / len(val_losses)
+                    loguru_logger.info(f"DEBUG - Validation Epoch {epoch}, Avg Loss: {avg_val_loss:.4f}")
+        
+        loguru_logger.info("DEBUG training finished.")
+        return
 
     # --- Configure Weights & Biases offline mode ---
     if args.wandb_offline:

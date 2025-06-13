@@ -25,14 +25,18 @@ class IouOverlapLoss(nn.Module):
         return (loss1 + loss2) / 2.0
 
 
-def extract_mask_bbox(masks, threshold=0.5):
+def extract_mask_bbox(masks, threshold=0.5, use_sigmoid=True):
     """Extract bounding boxes from mask predictions."""
     batch_size = masks.shape[0]
     device = masks.device
     bboxes = []
     
     for i in range(batch_size):
-        mask = (masks[i, 0] > threshold).float()
+        if use_sigmoid:
+            mask = (masks[i, 0].sigmoid() > threshold).float()
+        else:
+            mask = (masks[i, 0] > threshold).float()
+        
         if mask.sum() == 0:
             # Use full image as bbox if no pixels above threshold
             h, w = mask.shape
@@ -387,8 +391,8 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
     
     # 4. Mask-Box consistency loss (geometric consistency constraint)
     # Extract bboxes from predicted masks
-    mask_bbox0 = extract_mask_bbox(pred_mask[:, 0, :, :].unsqueeze(1))
-    mask_bbox1 = extract_mask_bbox(pred_mask[:, 1, :, :].unsqueeze(1))
+    mask_bbox0 = extract_mask_bbox(pred_mask[:, 0, :, :].unsqueeze(1), use_sigmoid=True)
+    mask_bbox1 = extract_mask_bbox(pred_mask[:, 1, :, :].unsqueeze(1), use_sigmoid=True)
     
     # Convert mask-derived boxes to original image coordinates
     mask_to_orig_scale_x0 = w0 / w_p

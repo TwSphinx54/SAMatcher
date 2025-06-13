@@ -14,6 +14,7 @@ except ImportError:
 
 
 def _init_weights(m):
+    """Initialize weights for linear and layer norm layers"""
     if isinstance(m, nn.Linear):
         trunc_normal_(m.weight, std=.02)
         if isinstance(m, nn.Linear) and m.bias is not None:
@@ -23,27 +24,61 @@ def _init_weights(m):
         nn.init.constant_(m.weight, 1.0)
 
 
-class RoPEPositionalEncoding(nn.Module):
-    """Rotary Position Embedding for enhanced position awareness in attention"""
+class ViewAwareRoPE(nn.Module):
+    """Rotary Position Embedding with view-aware capabilities for enhanced position encoding"""
     
-    def __init__(self, dim, max_seq_len=10000):
+    def __init__(self, dim, max_seq_len=10000, view_offset=0.1):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.view_offset = view_offset
         
         # Create frequency tensor
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         
-    def forward(self, seq_len, device):
-        """Generate RoPE encoding for given sequence length"""
+    def forward_interleaved(self, seq_len, device, view_aware=False):
+        """Generate RoPE encoding for interleaved features with optional view distinction
+        
+        Args:
+            seq_len: sequence length for interleaved features (2 * original_length)
+            device: torch device
+            view_aware: if True, add slight offset to distinguish views
+        """
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+        
+        if view_aware:
+            # Add slight offset for odd positions (view1) to distinguish from even positions (view0)
+            view_offsets = torch.zeros_like(t)
+            view_offsets[1::2] = self.view_offset
+            t = t + view_offsets
+            
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb
+    
+    def forward_single_view(self, seq_len, device, view_id=0, view_aware=False):
+        """Generate RoPE encoding for single view with optional view distinction
+        
+        Args:
+            seq_len: sequence length for single view
+            device: torch device  
+            view_id: 0 for first view, 1 for second view
+            view_aware: if True, add view-specific offset
+        """
+        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+        
+        if view_aware:
+            # Add view-specific offset
+            t = t + view_id * self.view_offset
+            
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb
     
     def apply_rope(self, x, rope_cache):
         """Apply RoPE rotation to query/key tensors
+        
         Args:
             x: (B_, num_heads, seq_len, head_dim) - query or key tensor
             rope_cache: (seq_len, head_dim) - precomputed rope encoding
@@ -65,14 +100,16 @@ class RoPEPositionalEncoding(nn.Module):
         
         # Apply standard RoPE rotation
         rotated_x = torch.cat([
-            x1 * cos_1 - x2 * sin_1,  # 实部
-            x1 * sin_1 + x2 * cos_1   # 虚部
+            x1 * cos_1 - x2 * sin_1,  # Real part
+            x1 * sin_1 + x2 * cos_1   # Imaginary part
         ], dim=-1)
         
         return rotated_x
 
 
 class Mlp(nn.Module):
+    """Multi-layer Perceptron with GELU activation"""
+    
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -92,7 +129,14 @@ class Mlp(nn.Module):
 
 
 def window_partition(x, window_size):
-    """Partition into non-overlapping windows"""
+    """Partition into non-overlapping windows
+    
+    Args:
+        x: (B, H, W, C)
+        window_size: window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
@@ -100,34 +144,44 @@ def window_partition(x, window_size):
 
 
 def window_reverse(windows, window_size, H, W):
-    """Reverse window partition to original spatial layout"""
+    """Reverse window partition to original spatial layout
+    
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size: window size
+        H: height of image
+        W: width of image
+    Returns:
+        x: (B, H, W, C)
+    """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
 
-class WindowAttentionWithRoPE(nn.Module):
-    """Window-based multi-head attention with RoPE and multiple attention variants"""
+class WindowAttentionWithViewAwareRoPE(nn.Module):
+    """Window-based attention with configurable view-aware RoPE for enhanced position encoding"""
 
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0., 
-                 attn_type='flash'):
+                 attn_type='flash', view_aware=False, view_offset=0.1):
         super().__init__()
         self.dim = dim
-        self.window_size = window_size  # Wh, Ww
+        self.window_size = window_size
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
         self.head_dim = head_dim
         self.attn_type = attn_type
+        self.view_aware = view_aware
 
         # Fallback if flash attention unavailable
         if attn_type == 'flash' and not FLASH_ATTN_AVAILABLE:
             print("Flash Attention not available, falling back to cosine attention")
             self.attn_type = 'cosine'
 
-        # RoPE for position encoding
-        self.rope = RoPEPositionalEncoding(head_dim)
+        # View-aware RoPE for position encoding
+        self.rope = ViewAwareRoPE(head_dim, view_offset=view_offset)
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -140,37 +194,93 @@ class WindowAttentionWithRoPE(nn.Module):
         
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask: Optional[torch.Tensor] = None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
+        # Flash Attention compatibility detection
+        self._flash_attn_available = FLASH_ATTN_AVAILABLE
+
+    def _prepare_flash_attn_inputs(self, q, k, v):
+        """Prepare inputs for Flash Attention with proper dtype conversion"""
+        # Check if any tensor is already in supported dtype
+        supported_dtypes = [torch.float16, torch.bfloat16]
+        current_dtype = q.dtype
+        
+        # If already in supported dtype, return as is
+        if current_dtype in supported_dtypes:
+            return q, k, v, current_dtype
+        
+        # Convert to fp16 for Flash Attention (most widely supported)
+        target_dtype = torch.float16
+        
+        # Check if the device supports fp16
+        if q.device.type == 'cuda':
+            try:
+                # Test if fp16 is supported on this device
+                test_tensor = torch.ones(1, device=q.device, dtype=torch.float16)
+                target_dtype = torch.float16
+            except RuntimeError:
+                # Fallback to bf16 if fp16 not supported
+                target_dtype = torch.bfloat16
+        else:
+            # For CPU, bf16 is usually better supported
+            target_dtype = torch.bfloat16
+        
+        q_converted = q.to(target_dtype)
+        k_converted = k.to(target_dtype)
+        v_converted = v.to(target_dtype)
+        
+        return q_converted, k_converted, v_converted, target_dtype
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None, is_interleaved=False, view_id=0):
+        """Window attention forward pass with view-aware RoPE"""
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # B_, num_heads, N, head_dim
 
-        # Apply RoPE to q and k
-        rope_cache = self.rope(N, device=x.device)
+        # Apply view-aware RoPE to q and k
+        if is_interleaved:
+            # For interleaved features (DoubleBlock)
+            rope_cache = self.rope.forward_interleaved(N, device=x.device, view_aware=self.view_aware)
+        else:
+            # For single view features (SingleBlock)  
+            rope_cache = self.rope.forward_single_view(N, device=x.device, view_id=view_id, view_aware=self.view_aware)
+            
         q = self.rope.apply_rope(q, rope_cache)
         k = self.rope.apply_rope(k, rope_cache)
 
-        if self.attn_type == 'flash' and mask is None:
-            # Flash Attention 2.0 - most efficient for long sequences
-            # Reshape for flash attention: (B_, N, num_heads, head_dim)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+        # Attention computation based on type
+        if self.attn_type == 'flash' and mask is None and self._flash_attn_available:
+            # Prepare inputs for Flash Attention with proper dtype
+            q_flash, k_flash, v_flash, flash_dtype = self._prepare_flash_attn_inputs(q, k, v)
             
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                x = flash_attn_func(q.half(), k.half(), v.half(), 
-                                   dropout_p=self.attn_drop.p if self.training else 0.0)
-            x = x.float().reshape(B_, N, C)
+            # Transpose for Flash Attention: (B_, num_heads, N, head_dim) -> (B_, N, num_heads, head_dim)
+            q_flash = q_flash.transpose(1, 2)
+            k_flash = k_flash.transpose(1, 2)
+            v_flash = v_flash.transpose(1, 2)
+            
+            try:
+                # Use Flash Attention with converted dtype
+                out = flash_attn_func(q_flash, k_flash, v_flash, 
+                                     dropout_p=self.attn_drop.p if self.training else 0.0)
+                # Convert back to original dtype if needed
+                if flash_dtype != x.dtype:
+                    out = out.to(x.dtype)
+                x = out.reshape(B_, N, C)
+                
+            except Exception as e:
+                # Fallback to standard attention
+                import warnings
+                warnings.warn(
+                    f"Flash Attention failed: {e}. Falling back to standard attention.",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
+                # Use original tensors for fallback (not converted ones)
+                attn = (q @ k.transpose(-2, -1)) * self.scale
+                attn = self.softmax(attn)
+                attn = self.attn_drop(attn)
+                x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
             
         elif self.attn_type == 'cosine':
-            # Cosine Attention - better for correlation tasks
             attn = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1))
-            # Fix device mismatch by ensuring tensor is on the same device as logit_scale
             max_logit = torch.log(torch.tensor(1. / 0.01, device=self.logit_scale.device))
             logit_scale = torch.clamp(self.logit_scale, max=max_logit).exp()
             attn = attn * logit_scale
@@ -185,18 +295,15 @@ class WindowAttentionWithRoPE(nn.Module):
             x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
             
         elif self.attn_type == 'linear':
-            # Linear Attention - O(N) complexity
             q = F.elu(q) + 1
             k = F.elu(k) + 1
             
-            # Compute linear attention
             kv = torch.einsum('bhnd,bhnf->bhdf', k, v)
             normalizer = torch.einsum('bhnd,bhd->bhn', q, k.sum(dim=2))
             x = torch.einsum('bhnd,bhdf->bhnf', q, kv) / (normalizer.unsqueeze(-1) + 1e-6)
             x = x.transpose(1, 2).reshape(B_, N, C)
             
-        else:
-            # Standard scaled dot-product attention
+        else:  # Standard scaled dot-product attention
             attn = (q @ k.transpose(-2, -1)) * self.scale
             
             if mask is not None:
@@ -218,26 +325,28 @@ class DoubleBlock(nn.Module):
     
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_type='cosine'):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_type='cosine',
+                 view_aware=False, view_offset=0.1):
         super().__init__()
         self.dim = dim
-        # Double the height to accommodate concatenated sequences
-        self.input_resolution = (input_resolution[0] * 2, input_resolution[1])
+        self.input_resolution = (input_resolution[0], input_resolution[1] * 2)
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
+        self.view_aware = view_aware
         
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window-size"
+        assert 0 <= self.shift_size < self.window_size, "shift_size must be in 0-window-size"
 
-        # Process concatenated features (same dim, double length)
+        # Process concatenated features with view-aware RoPE
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttentionWithRoPE(
+        self.attn = WindowAttentionWithViewAwareRoPE(
             dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, attn_type=attn_type)
+            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, attn_type=attn_type,
+            view_aware=view_aware, view_offset=view_offset)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -270,18 +379,24 @@ class DoubleBlock(nn.Module):
         self.register_buffer("attn_mask", attn_mask)
 
     def forward(self, x0, x1):
-        """Concatenate along sequence dimension and process together"""
+        """Ensure windows contain mixed features from both views for cross-view interaction"""
         H, W = self.input_resolution
-        original_H = H // 2  # Original height before concatenation
+        original_W = W // 2
         B, L, C = x0.shape
-        assert L == original_H * W, "input feature has wrong size"
-
-        # Concatenate along sequence dimension (L dimension)
-        x_concat = torch.cat([x0, x1], dim=1)  # (B, 2*L, C)
-        shortcut = x_concat
-        x_concat = self.norm1(x_concat)
-        x_concat = x_concat.view(B, H, W, C)  # H = 2 * original_H
-
+        
+        # Interleave features spatially
+        x0_spatial = x0.view(B, H, original_W, C)
+        x1_spatial = x1.view(B, H, original_W, C)
+        
+        # Interleave along width: [x0_col0, x1_col0, x0_col1, x1_col1, ...]
+        x_interleaved = torch.stack([x0_spatial, x1_spatial], dim=3)  # (B, H, original_W, 2, C)
+        x_concat = x_interleaved.view(B, H, W, C)  # (B, H, 2*original_W, C)
+        
+        # Correct shortcut dimensions
+        shortcut = x_concat.view(B, H * W, C)  # (B, H * 2*original_W, C)
+        x_concat_flat = self.norm1(shortcut)
+        x_concat = x_concat_flat.view(B, H, W, C)
+        
         # Shifted window attention
         if self.shift_size > 0:
             shifted_x = torch.roll(x_concat, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
@@ -292,8 +407,8 @@ class DoubleBlock(nn.Module):
         x_windows = window_partition(shifted_x, self.window_size)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
-        # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)
+        # W-MSA/SW-MSA with view-aware RoPE for interleaved features
+        attn_windows = self.attn(x_windows, mask=self.attn_mask, is_interleaved=True)
 
         # Merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -304,7 +419,7 @@ class DoubleBlock(nn.Module):
             x_concat = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x_concat = shifted_x
-        x_concat = x_concat.view(B, H * W, C)  # (B, 2*L, C)
+        x_concat = x_concat.view(B, H * W, C)
 
         # Residual connection and MLP
         x_concat = shortcut + self.drop_path(x_concat)
@@ -312,13 +427,35 @@ class DoubleBlock(nn.Module):
 
         return x_concat
 
+    def split_interleaved_features(self, x_concat):
+        """Split interleaved features back to separate views"""
+        H, W = self.input_resolution
+        original_W = W // 2
+        B, _, C = x_concat.shape
+        
+        x_spatial = x_concat.view(B, H, W, C)  # (B, H, 2*original_W, C)
+        
+        # Split back to interleaved format
+        x_interleaved = x_spatial.view(B, H, original_W, 2, C)  # (B, H, original_W, 2, C)
+        
+        # Extract two views
+        x0_spatial = x_interleaved[:, :, :, 0, :]  # (B, H, original_W, C)
+        x1_spatial = x_interleaved[:, :, :, 1, :]  # (B, H, original_W, C)
+        
+        # Flatten back to sequence format
+        x0 = x0_spatial.view(B, H * original_W, C)
+        x1 = x1_spatial.view(B, H * original_W, C)
+        
+        return x0, x1
+
 
 class SingleBlock(nn.Module):
-    """Processes each view independently for view-specific features"""
+    """Processes each view independently for view-specific feature extraction"""
     
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_type='flash'):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, attn_type='flash',
+                 view_aware=False, view_offset=0.1):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -326,16 +463,18 @@ class SingleBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
+        self.view_aware = view_aware
         
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window-size"
+        assert 0 <= self.shift_size < self.window_size, "shift_size must be in 0-window-size"
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttentionWithRoPE(
+        self.attn = WindowAttentionWithViewAwareRoPE(
             dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, attn_type=attn_type)
+            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, attn_type=attn_type,
+            view_aware=view_aware, view_offset=view_offset)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -367,8 +506,8 @@ class SingleBlock(nn.Module):
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def forward(self, x):
-        """Process single view with self-attention"""
+    def forward(self, x, view_id=0):
+        """Process single view with view-aware self-attention"""
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
@@ -387,8 +526,8 @@ class SingleBlock(nn.Module):
         x_windows = window_partition(shifted_x, self.window_size)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
-        # W-MSA/SW-MSA with RoPE
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)
+        # W-MSA/SW-MSA with view-aware RoPE for single view
+        attn_windows = self.attn(x_windows, mask=self.attn_mask, is_interleaved=False, view_id=view_id)
 
         # Merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -409,20 +548,19 @@ class SingleBlock(nn.Module):
 
 
 class SymSwinFuser(nn.Module):
-    """Swin Transformer V2 with D×N + S×M architecture for dual-view processing
-    
-    Architecture: D×N Double blocks for cross-view interaction + S×M Single blocks for view-specific processing
-    """
+    """Symmetric Swin Transformer with configurable view-aware RoPE for dual-view feature fusion"""
 
     def __init__(self, feat_size=40, feat_chan=256, double_depths=[2, 2], single_depths=[6, 2], 
                  num_heads=[3, 6, 12, 24], window_size=7, mlp_ratio=4., qkv_bias=True, 
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm,
-                 double_attn_type='cosine', single_attn_type='flash'):
+                 double_attn_type='cosine', single_attn_type='flash',
+                 view_aware=False, view_offset=0.1):
         super().__init__()
 
         self.feat_size = feat_size
         self.feat_chan = feat_chan
         self.flat_len = feat_size * feat_size
+        self.view_aware = view_aware
         
         # Calculate total blocks for stochastic depth scheduling
         total_double_blocks = sum(double_depths)
@@ -449,7 +587,9 @@ class SymSwinFuser(nn.Module):
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[block_idx],
                     norm_layer=norm_layer,
-                    attn_type=double_attn_type)
+                    attn_type=double_attn_type,
+                    view_aware=view_aware,
+                    view_offset=view_offset)
                 layer_blocks.append(block)
                 block_idx += 1
             self.double_layers.append(layer_blocks)
@@ -471,7 +611,9 @@ class SymSwinFuser(nn.Module):
                     attn_drop=attn_drop_rate,
                     drop_path=dpr[block_idx],
                     norm_layer=norm_layer,
-                    attn_type=single_attn_type)
+                    attn_type=single_attn_type,
+                    view_aware=view_aware,
+                    view_offset=view_offset)
                 layer_blocks.append(block)
                 block_idx += 1
             self.single_layers.append(layer_blocks)
@@ -479,7 +621,7 @@ class SymSwinFuser(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, x0, x1):
-        """Forward pass through D×N + S×M architecture"""
+        """Forward pass through D×N + S×M architecture for dual-view feature fusion"""
         B, L, C = x0.shape
         assert x1.shape == (B, L, C), f"Input shapes must match: x0={x0.shape}, x1={x1.shape}"
         assert L == self.flat_len, f"Input length {L} must match expected {self.flat_len}"
@@ -488,23 +630,21 @@ class SymSwinFuser(nn.Module):
         # Phase 1: Double layers - cross-view interaction
         for i, layer_blocks in enumerate(self.double_layers):
             if i == 0:
-                # First double layer: process individual views and concatenate in L dimension
                 for block in layer_blocks:
-                    x_concat = block(x0, x1)  # Returns (B, 2*L, C)
+                    x_concat = block(x0, x1)
             else:
-                # Subsequent double layers: split and re-process
                 for block in layer_blocks:
-                    x0_temp, x1_temp = torch.chunk(x_concat, 2, dim=1)  # Split along L dimension
+                    x0_temp, x1_temp = block.split_interleaved_features(x_concat)
                     x_concat = block(x0_temp, x1_temp)
 
         # Phase 2: Single layers - view-specific processing
         if len(self.double_layers) > 0:
-            # Split concatenated features back to individual views along L dimension
-            x0, x1 = torch.chunk(x_concat, 2, dim=1)
+            last_double_block = self.double_layers[-1][-1]
+            x0, x1 = last_double_block.split_interleaved_features(x_concat)
         
         for layer_blocks in self.single_layers:
             for block in layer_blocks:
-                x0 = block(x0)
-                x1 = block(x1)
+                x0 = block(x0, view_id=0)  # Process first view
+                x1 = block(x1, view_id=1)  # Process second view
 
         return x0, x1
