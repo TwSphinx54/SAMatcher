@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+nohup.out
+
+# Virtual environments
+.venv
+.vscode
+.cache
+.ropeproject
+
+# Others
+checkpoints/
+outputs/
+pretrained_checkpoint/
+wandb/
+data/
+weights/
+third_party/
