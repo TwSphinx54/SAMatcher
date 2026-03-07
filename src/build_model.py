@@ -105,7 +105,7 @@ class ModelTrainer():
             })
 
         with self.profiler.profile("Compute losses"):
-            loss(batch)
+            loss(batch, visualize_weights=False)
 
     def _compute_metrics(self, batch: dict) -> dict:
         """

@@ -1,18 +1,9 @@
 #! /usr/bin/env python3
-import argparse
-import logging
 import os
-import pprint
 from pathlib import Path
-
-import h5py
 import numpy as np
-import torch
 from tqdm import tqdm
 
-from . import matchers
-from .utils.base_model import dynamic_load
-from .utils.parsers import names_to_pair
 from .utils.utils import get_foreground_mask, read_image
 
 """
@@ -122,37 +113,18 @@ def preprocess_match_pipeline(
         matching,
         with_desc=False,
 ):
-    """main process of match pipeline.
-
-    Args:
-        input (str): input directory of dataset
-        name0, name1 (str): image0 and image1's names
-        device (str): device of model and data
-        resize (list): resize data
-        resize_float (bool): resize use float type or not
-        gray (bool): read with gray style or not
-        align (str): image alignment with division to 16, 32 or others
-        config (Dict): configuration of extractor, matcher
-        pair (list): data info
-        matching (model): matching model
-        with_desc (bool, optional): output descriptor. Defaults to False.
-
-    Returns:
-        dict: return all processed information
-    """
+    """Run the standard matching pipeline for one image pair."""
     image0, inp0, scales0 = read_image(os.path.join(input, name0), device,
-                                       resize, 0, resize_float, gray, align)
+                                       resize, 0, resize_float, gray, align,
+                                       pad_square=True)
     image1, inp1, scales1 = read_image(os.path.join(input, name1), device,
-                                       resize, 0, resize_float, gray, align)
+                                       resize, 0, resize_float, gray, align,
+                                       pad_square=True)
 
-    K0 = np.array(pair[2:11]).astype(np.float).reshape(3, 3)
-    K1 = np.array(pair[11:20]).astype(np.float).reshape(3, 3)
-    T_0to1 = np.array(pair[20:36]).astype(np.float).reshape(4, 4)
+    K0 = np.array(pair[2:11]).astype(np.float64).reshape(3, 3)
+    K1 = np.array(pair[11:20]).astype(np.float64).reshape(3, 3)
+    T_0to1 = np.array(pair[20:36]).astype(np.float64).reshape(4, 4)
 
-    # if image0 is None or image1 is None:
-    #     raise ValueError(
-    #         "Problem reading image pair: {}/{} {}/{}".format(input, name0, input, name1)
-    #     )
     if 'icp' in config['matcher']['model']['name']:
         mask0 = get_foreground_mask(image0.astype(np.uint8),
                                     **config['matcher']['preprocessing'])
@@ -166,7 +138,6 @@ def preprocess_match_pipeline(
         })
         return {'mask0': mask0, 'mask1': mask1, 'T_0_1': pred['T_0_1']}
     else:
-        # Perform the matching.
         if config['landmark']:
             landmark = np.array(pair[2:], dtype=float).reshape(-1, 2)
             landmark_len = int(landmark.shape[0] / 2)
@@ -178,15 +149,21 @@ def preprocess_match_pipeline(
             })
         else:
             pred = matching({'image0': inp0, 'image1': inp1})
-    # prediction results to numpy array
+
+    # Convert prediction tensors to numpy arrays.
     pred = dict((k, v[0].cpu().numpy()) for k, v in pred.items())
     kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
     matches, conf = pred['matches0'], pred['matching_scores0']
     if with_desc:
         desc0, desc1 = pred['descriptors0'], pred['descriptors1']
+
     valid = matches > -1
     index0 = np.nonzero(valid)[0]
     index1 = matches[valid]
+
+    # Coordinate convention:
+    # - kpts*: original-image coordinates
+    # - kpts*_ori: model-input coordinates
     results = {
         'image0': image0,
         'image1': image1,
@@ -201,14 +178,15 @@ def preprocess_match_pipeline(
         'K0': K0,
         'K1': K1,
         'T_0to1': T_0to1,
-        'mkpts0': kpts0[index0],
-        'mkpts1': kpts1[index1],
+        # Evaluation keypoints are stored in original-image coordinates.
+        'mkpts0': (kpts0 * scales0)[index0],
+        'mkpts1': (kpts1 * scales1)[index1],
         'bbox0': None,
         'bbox1': None,
         'mask0': None,
         'mask1': None,
     }
-    # return descriptors
+
     if with_desc:
         results['desc0'] = desc0
         results['desc1'] = desc1

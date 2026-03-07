@@ -217,10 +217,9 @@ class MaskDecoderHQ(nn.Module):
             self.mask_tokens.weight,
         ])
         
+        token_list.append(self.hf_token.weight)
         if self.pred_bbox:
             token_list.append(self.bbox_token.weight)
-            
-        token_list.append(self.hf_token.weight)
         
         output_tokens = torch.cat(token_list, dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(

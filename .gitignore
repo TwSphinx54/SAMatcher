@@ -12,9 +12,6 @@ nohup.out
 .vscode
 .cache
 .ropeproject
-uv.lock
-pyproject.toml
-.python-version
 
 # Others
 checkpoints/

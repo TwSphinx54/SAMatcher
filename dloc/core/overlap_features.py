@@ -59,7 +59,9 @@ confs = {
         'model': {
             'name': 'samatcher',
             'model': 'samatcher',
-            'weights': 'samatcher_0611.ckpt',
+            # 'weights': 'samatcher_0611.ckpt',
+            # 'weights': 'samatcher_base.ckpt',
+            'weights': 'samatcher_best.ckpt',
         },
     },
 }
@@ -181,6 +183,8 @@ def process(
         overlap_time,
         pred['mask0'],
         pred['mask1'],
+        pred['mask0_o'],
+        pred['mask1_o'],
     )
 
 
@@ -199,52 +203,42 @@ def preprocess_overlap_pipeline(
         with_desc=False,
         warp_origin=True,
 ):
-    """Preprocess image pair for overlap-based matching pipeline.
-    
-    Args:
-        input (str): input directory path
-        name0, name1 (str): image file names
-        device (str): computation device (cuda/cpu)
-        resize (list): resize parameters
-        resize_float (bool): whether to resize after float conversion
-        gray (bool): whether to convert to grayscale
-        align (str): alignment method
-        config (dict): pipeline configuration
-        pair (list): image pair metadata
-        matching (model): matching model instance
-        with_desc (bool): whether to extract descriptors
-        warp_origin (bool): whether to warp to original scale
-        
-    Returns:
-        dict: processed results including keypoints, descriptors, and metadata
-    """
-    # Read and preprocess images with overlap estimation
-    image0, overlap_inp0, inp0, scales0, overlap_scales0 = read_overlap_image(
+    """Preprocess an image pair for overlap-aware matching."""
+    # Read overlap-model inputs (aligned/padded) and matching inputs (original resolution).
+    ovl_vis0, overlap_inp0, _, _, overlap_scales0 = read_overlap_image(
         os.path.join(input, name0), device, resize, 0, resize_float, gray,
         align, True)
-    image1, overlap_inp1, inp1, scales1, overlap_scales1 = read_overlap_image(
+    ovl_vis1, overlap_inp1, _, _, overlap_scales1 = read_overlap_image(
         os.path.join(input, name1), device, resize, 0, resize_float, gray,
         align, True)
-    
-    # Extract camera intrinsics and pose from pair metadata
+
+    # Read original images for downstream crop/filter/match stages.
+    image0, inp0, _ = read_image(
+        os.path.join(input, name0), device, [-1], 0, resize_float, gray,
+        align='', overlap=False, pad_square=False)
+    image1, inp1, _ = read_image(
+        os.path.join(input, name1), device, [-1], 0, resize_float, gray,
+        align='', overlap=False, pad_square=False)
+
+    # Camera intrinsics/extrinsics from pair metadata.
     K0 = np.array(pair[2:11]).astype(float).reshape(3, 3)
     K1 = np.array(pair[11:20]).astype(float).reshape(3, 3)
     T_0to1 = np.array(pair[20:36]).astype(float).reshape(4, 4)
 
-    if image0 is None or image1 is None:
+    if ovl_vis0 is None or ovl_vis1 is None:
         raise ValueError('Problem reading image pair: {}/{} {}/{}'.format(
             input, name0, input, name1))
     
-    # Extract dataset name from path
     dataset_name = name1.split('/')[0]
 
     # Process with overlap estimation
     (
         kpts0, desc0, index0, kpts1, desc1, index1, conf, valid,
-        oxy0, oxy1, ratio0, ratio1, bbox0, bbox1, overlap_time, mask0, mask1
+        oxy0, oxy1, ratio0, ratio1, bbox0, bbox1, overlap_time, mask0, mask1, mask0_o, mask1_o
     ) = process(
-        config, pair, matching, with_desc, scales0, inp0, overlap_inp0,
-        overlap_scales0, scales1, inp1, overlap_inp1, overlap_scales1,
+        config, pair, matching, with_desc,
+        (1.0, 1.0), inp0, overlap_inp0, overlap_scales0,
+        (1.0, 1.0), inp1, overlap_inp1, overlap_scales1,
         dataset_name, warp_origin=warp_origin,
     )
 
@@ -252,20 +246,41 @@ def preprocess_overlap_pipeline(
     if index0.shape[0] < 30:
         (
             kpts0, desc0, index0, kpts1, desc1, index1, conf, valid,
-            oxy0, oxy1, ratio0, ratio1, bbox0, bbox1, _, mask0, mask1
+            oxy0, oxy1, ratio0, ratio1, bbox0, bbox1, _, mask0, mask1, mask0_o, mask1_o
         ) = process(
-            config, pair, matching, with_desc, scales0, inp0, overlap_inp0,
-            overlap_scales0, scales1, inp1, overlap_inp1, overlap_scales1,
+            config, pair, matching, with_desc,
+            (1.0, 1.0), inp0, overlap_inp0, overlap_scales0,
+            (1.0, 1.0), inp1, overlap_inp1, overlap_scales1,
             dataset_name, False,
         )
     
+    # Coordinate convention:
+    # - kpts0/kpts1 are always in original-image coordinates (for evaluation/export).
+    # - kpts0_ori/kpts1_ori follow visualization input coordinates (same here).
+    if warp_origin:
+        # Matching already maps keypoints back to original-image coordinates.
+        kpts0_out = kpts0
+        kpts1_out = kpts1
+        kpts0_img = kpts0_out
+        kpts1_img = kpts1_out
+    else:
+        # Compatibility branch if future outputs are in crop/input coordinates.
+        kpts0_out = kpts0
+        kpts1_out = kpts1
+        kpts0_img = kpts0
+        kpts1_img = kpts1
+
+    # Matching is performed on original images in this pipeline.
+    scales0 = np.array([1.0, 1.0], dtype=np.float32)
+    scales1 = np.array([1.0, 1.0], dtype=np.float32)
+
     return {
         'image0': image0,
         'image1': image1,
-        'kpts0': kpts0 * scales0,
-        'kpts1': kpts1 * scales1,
-        'kpts0_ori': kpts0,
-        'kpts1_ori': kpts1,
+        'kpts0': kpts0_out,
+        'kpts1': kpts1_out,
+        'kpts0_ori': kpts0_img,
+        'kpts1_ori': kpts1_img,
         'desc0': desc0,
         'desc1': desc1,
         'index0': index0,
@@ -281,13 +296,16 @@ def preprocess_overlap_pipeline(
         'K0': K0,
         'K1': K1,
         'T_0to1': T_0to1,
-        'mkpts0': kpts0[index0],
-        'mkpts1': kpts1[index1],
+        # Evaluation keypoints must stay in original-image coordinates.
+        'mkpts0': kpts0_out[index0],
+        'mkpts1': kpts1_out[index1],
         'bbox0': bbox0,
         'bbox1': bbox1,
         'overlap_time': overlap_time,
         'mask0': mask0, 
-        'mask1': mask1
+        'mask1': mask1,
+        'mask0_o': mask0_o,
+        'mask1_o': mask1_o,
     }
 
 

@@ -216,16 +216,13 @@ class SAM2HQBase(torch.nn.Module):
             attn_drop_rate=0.1,
             drop_path_rate=0.1,
             double_attn_type='cosine',        # Best for correlation tasks
-            single_attn_type='flash'          # Efficient for independent processing
+            single_attn_type='flash',          # Efficient for independent processing
         )
 
-        self.sparse_lemb0 = nn.Embedding(1, d_model)
-        self.sparse_lemb1 = nn.Embedding(1, d_model)
         feat_size = self.image_size // 16
-        self.dense_lemb0 = nn.Parameter(torch.zeros(1, d_model, feat_size, feat_size))
-        self.dense_lemb1 = nn.Parameter(torch.zeros(1, d_model, feat_size, feat_size))
-        trunc_normal_(self.dense_lemb0, std=0.02)
-        trunc_normal_(self.dense_lemb1, std=0.02)
+        self.sparse_lemb = nn.Embedding(1, d_model)  # shared prompt
+        self.dense_lemb = nn.Parameter(torch.zeros(1, d_model, feat_size, feat_size))  # shared prompt
+        trunc_normal_(self.dense_lemb, std=0.02)
 
     
     def forward(self, img0, img1) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -280,35 +277,32 @@ class SAM2HQBase(torch.nn.Module):
         emb0 = emb0.permute(0, 2, 1).reshape(b_emb, c_emb, h_emb, w_emb)
         emb1 = emb1.permute(0, 2, 1).reshape(b_emb, c_emb, h_emb, w_emb)
 
-        # For image 0 - use learnable embeddings
-        sparse_embeddings_0 = self.sparse_lemb0.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        dense_embeddings_0 = self.dense_lemb0.expand(batch_size, -1, -1, -1)
+        # For both views - use the same learnable prompts
+        sparse_embeddings = self.sparse_lemb.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        dense_embeddings = self.dense_lemb.expand(batch_size, -1, -1, -1)
 
-        masks0, iou_pred0, sam_tokens_out0, object_score_logits0, bbox_pred0 = self.sam_mask_decoder(
-            image_embeddings=emb0,
+        # 不固定位置示例
+        emb = torch.cat([emb0, emb1], dim=0)
+        sparse = sparse_embeddings
+        dense = dense_embeddings
+        sparse = torch.cat([sparse, sparse], dim=0)
+        dense = torch.cat([dense, dense], dim=0)
+        high_res = None if not self.use_high_res_features_in_sam else [
+            torch.cat([high_res_features_for_decoder0[0], high_res_features_for_decoder1[0]], dim=0),
+            torch.cat([high_res_features_for_decoder0[1], high_res_features_for_decoder1[1]], dim=0),
+        ]
+        masks, iou_pred, sam_tokens_out, object_score_logits, bbox_pred = self.sam_mask_decoder(
+            image_embeddings=emb,
             image_pe=image_pe_for_decoder,
-            sparse_prompt_embeddings=sparse_embeddings_0,
-            dense_prompt_embeddings=dense_embeddings_0,
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
             multimask_output=False,
             repeat_image=False,
-            high_res_features=high_res_features_for_decoder0,
+            high_res_features=high_res,
             hq_token_only=False
         )
-
-        # For image 1 - use learnable embeddings  
-        sparse_embeddings_1 = self.sparse_lemb1.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        dense_embeddings_1 = self.dense_lemb1.expand(batch_size, -1, -1, -1)
-
-        masks1, iou_pred1, sam_tokens_out1, object_score_logits1, bbox_pred1 = self.sam_mask_decoder(
-            image_embeddings=emb1,
-            image_pe=image_pe_for_decoder,
-            sparse_prompt_embeddings=sparse_embeddings_1,
-            dense_prompt_embeddings=dense_embeddings_1,
-            multimask_output=False,
-            repeat_image=False,
-            high_res_features=high_res_features_for_decoder1,
-            hq_token_only=False
-        )
+        masks0, masks1 = masks[:batch_size], masks[batch_size:]
+        bbox_pred0, bbox_pred1 = bbox_pred[:batch_size], bbox_pred[batch_size:]
 
         # Combine masks from both images
         masks = torch.cat([masks0, masks1], dim=1)  # Shape: (B, 2, H, W)

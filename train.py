@@ -3,7 +3,7 @@ import torch
 import pprint
 import argparse
 import warnings
-import time # Ensure time is imported
+import time
 import os
 from pathlib import Path
 from src.build_model import ModelTrainer
@@ -16,10 +16,11 @@ from accelerate.utils import set_seed
 from src.utils.profiler import build_profiler
 from src.utils.optimizers import build_optimizer, build_scheduler
 
-warnings.filterwarnings("ignore") # Suppress warnings
+warnings.filterwarnings("ignore")
+
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('--data_cfg_path', type=str, default='config/train_config.py', help='Path to data configuration file.')
@@ -47,10 +48,7 @@ def parse_args():
 
     parser.add_argument('--profiler_name', type=str, default=None, help='Profiler to use (e.g., "pytorch", "inference"). Leave None to disable.')
 
-    # Add val_batch_size to args if not present, for MultiSceneDataModule
     parser.add_argument('--val_batch_size', type=int, default=2, help='Batch size for validation and testing per GPU.')
-    
-    # Add debug mode flag
     parser.add_argument('--debug', action='store_true', help='Enable debug mode for single GPU without Accelerator and WandB.')
 
     return parser.parse_args()
@@ -58,42 +56,35 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # --- Debug Mode Setup ---
+    # Debug mode: single device, no Accelerator/W&B.
     if args.debug:
         loguru_logger.info("Running in DEBUG mode - single GPU, no Accelerator, no WandB")
-        
-        # Set device
+
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         loguru_logger.info(f"Using device: {device}")
-        
-        # Set seed
         set_seed(args.seed)
-        
-        # Simple output directory
+
         current_time_str = time.strftime("%Y%m%d-%H%M%S")
         run_specific_output_dir = Path(args.output_dir) / args.exp_name / f"debug_{current_time_str}"
         run_specific_output_dir.mkdir(parents=True, exist_ok=True)
         loguru_logger.info(f"Debug output directory: {run_specific_output_dir}")
-        
-        # Load config
+
         config = get_cfg_defaults()
         config.merge_from_file(args.data_cfg_path)
-        
-        # Simple config setup for debug
         config.TRAINER.WORLD_SIZE = 1
         config.TRAINER.TRUE_BATCH_SIZE = args.batch_size
         config.TRAINER.TRUE_LR = args.true_lr
-        config.TRAINER.WARMUP_STEP = 0  # Disable warmup in debug mode
-        
+        config.TRAINER.WARMUP_STEP = 0
+
         # Create data module without accelerator
         data_module = MultiSceneDataModule(args, config, None)  # Pass None for accelerator
         train_dataloader = data_module.train_dataloader()
         val_dataloader = data_module.val_dataloader()
-        
+
         # Build model
         sam_model = build_samatcher(args.sam_cfg, args.sam_checkpoint)
         sam_model = sam_model.to(device)
-        
+
         # Create model handler
         model_handler = ModelTrainer(
             config,
@@ -104,111 +95,107 @@ def main():
             dump_dir=str(run_specific_output_dir / "visualizations")
         )
         model = model_handler.model
-        
+
         # Simple optimizer setup
         optimizer_params = filter(lambda p: p.requires_grad, model.parameters())
         optimizer = build_optimizer(optimizer_params, config)
         scheduler = build_scheduler(config, optimizer)
-        
+
         # Debug training loop
         loguru_logger.info(f"Starting DEBUG training for {args.num_epochs} epochs.")
-        
+
         for epoch in range(args.num_epochs):
             model.train()
-            
+
             for step, batch in enumerate(train_dataloader):
                 if batch is None:
                     continue
-                
+
                 # Move batch to device
                 if isinstance(batch, dict):
                     for key, value in batch.items():
                         if isinstance(value, torch.Tensor):
                             batch[key] = value.to(device)
-                
+
                 # Forward pass
                 model_handler._trainval_inference(batch)
                 loss = batch['loss']
-                
+
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
-                
+
                 # Gradient clipping
                 if config.TRAINER.GRADIENT_CLIPPING > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAINER.GRADIENT_CLIPPING)
-                
+
                 optimizer.step()
-                
+
                 # Simple logging
                 if step % args.log_every_n_steps == 0:
                     loguru_logger.info(f"DEBUG - Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}")
-                
-                # Break early in debug mode for faster iteration
-                if step >= 10:  # Only run 10 steps per epoch in debug
+
+                # Short debug epoch for fast iteration.
+                if step >= 10:
                     break
-            
+
             # Step scheduler
             if scheduler is not None and scheduler['interval'] == 'epoch':
                 scheduler['scheduler'].step()
-            
+
             # Simple validation in debug mode
             if epoch % args.val_every_n_epochs == 0:
                 model.eval()
                 val_losses = []
-                
                 with torch.no_grad():
                     for val_step, val_batch in enumerate(val_dataloader):
                         if val_batch is None:
                             continue
-                        
-                        # Move batch to device
                         if isinstance(val_batch, dict):
                             for key, value in val_batch.items():
                                 if isinstance(value, torch.Tensor):
                                     val_batch[key] = value.to(device)
-                        
+
                         model_handler._trainval_inference(val_batch)
                         val_losses.append(val_batch['loss'].item())
-                        
-                        # Break early in debug mode
-                        if val_step >= 5:  # Only run 5 validation steps
+
+                        # Short debug validation.
+                        if val_step >= 5:
                             break
-                
+
                 if val_losses:
                     avg_val_loss = sum(val_losses) / len(val_losses)
                     loguru_logger.info(f"DEBUG - Validation Epoch {epoch}, Avg Loss: {avg_val_loss:.4f}")
-        
+
         loguru_logger.info("DEBUG training finished.")
         return
 
-    # --- Configure Weights & Biases offline mode ---
+    # W&B offline mode.
     if args.wandb_offline:
         os.environ["WANDB_MODE"] = "offline"
         loguru_logger.info("Weights & Biases set to offline mode")
 
-    # --- Initialize Accelerator and set seed ---
+    # Distributed runtime setup.
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         log_with=["wandb"],
-        project_dir=args.output_dir, # Base directory for Accelerator's own logs if any
+        project_dir=args.output_dir,
         mixed_precision=args.mixed_precision,
     )
     set_seed(args.seed)
 
-    # --- Setup Logging ---
-    # Configure loguru to use accelerator.print for distributed-friendly logging.
+    # Route logs through accelerator.print for distributed-safe output.
     loguru_logger.remove()
     loguru_logger.add(lambda msg: accelerator.print(msg), format="{time} {level} {message}", level="INFO")
 
-    # --- Create a run-specific output directory ---
+    # Create a run-specific output directory
     current_time_str = time.strftime("%Y%m%d-%H%M%S")
     run_specific_output_dir = Path(args.output_dir) / args.exp_name / current_time_str
     if accelerator.is_main_process:
         run_specific_output_dir.mkdir(parents=True, exist_ok=True)
         loguru_logger.info(f"Run-specific output directory: {run_specific_output_dir}")
 
-    # --- Initialize Weights & Biases (on main process only) ---
+    # Initialize Weights & Biases (on main process only)
     if accelerator.is_main_process:
         wandb_project_name = args.wandb_project if args.wandb_project else args.exp_name
         # Reuse current_time_str for a consistent run identifier
@@ -217,7 +204,7 @@ def main():
         init_kwargs = {"wandb": {"name": custom_run_name}}
         if args.wandb_entity:
             init_kwargs["wandb"]["entity"] = args.wandb_entity
-        
+
         # Add offline mode configuration
         if args.wandb_offline:
             init_kwargs["wandb"]["mode"] = "offline"
@@ -226,7 +213,7 @@ def main():
         accelerator.init_trackers(project_name=wandb_project_name, config=vars(args), init_kwargs=init_kwargs)
         loguru_logger.info(f"Run arguments: {pprint.pformat(vars(args))}")
 
-    # --- Load and adapt configuration ---
+    # Load and adapt configuration
     config = get_cfg_defaults()
     config.merge_from_file(args.data_cfg_path)
 
@@ -235,10 +222,7 @@ def main():
     config.TRAINER.TRUE_BATCH_SIZE = config.TRAINER.WORLD_SIZE * args.batch_size * args.gradient_accumulation_steps
     config.TRAINER.TRUE_LR = args.true_lr
 
-    # Scaling logic is removed.
-    # Initialize WARMUP_STEP.
-    # If WARMUP_EPOCHS is set (>0) in config, WARMUP_STEP will be calculated after dataloader initialization.
-    # Otherwise, WARMUP_STEP from config (e.g., default.py or train_config.py) will be used.
+    # Warmup setup (WARMUP_STEP can be derived from WARMUP_EPOCHS after dataloader creation).
     if not (hasattr(config.TRAINER, 'WARMUP_STEP') and config.TRAINER.WARMUP_STEP > 0):
         config.TRAINER.WARMUP_STEP = 0
 
@@ -261,7 +245,6 @@ def main():
                         f"Calculated 0 optimizer steps_per_epoch for warmup "
                         f"(len(train_dataloader)={len(train_dataloader)}, "
                         f"grad_accum_steps={args.gradient_accumulation_steps}). "
-                        f"This can happen if the dataset size per process is smaller than gradient_accumulation_steps. "
                         f"Setting WARMUP_STEP to 0."
                     )
                 config.TRAINER.WARMUP_STEP = 0
@@ -309,8 +292,7 @@ def main():
     )
     model = model_handler.model
 
-    # This section creates parameter groups for the optimizer, allowing different LRs for different parts of the model.
-    # E.g., 'mask_decoder' parameters might use a smaller LR for fine-tuning.
+    # Build optimizer parameter groups (optional lower LR for mask_decoder).
     finetune_params = []
     new_params = []
     for name, param in model.named_parameters():
@@ -344,56 +326,89 @@ def main():
         model, optimizer, train_dataloader, val_dataloader, scheduler
     )
 
-    # --- Training Loop ---
+    # Resume support.
+    start_epoch = 0
     total_steps = 0
+
+    if args.ckpt_path:
+        ckpt_path = Path(args.ckpt_path)
+        if not ckpt_path.exists():
+            accelerator.print(f"Checkpoint not found: {ckpt_path}")
+        else:
+            if accelerator.is_main_process:
+                loguru_logger.info(f"Resuming from checkpoint: {ckpt_path}")
+
+            ckpt = torch.load(str(ckpt_path), map_location='cpu')
+            unwrapped = accelerator.unwrap_model(model)
+
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                unwrapped.load_state_dict(ckpt['model_state_dict'], strict=False)
+                accelerator.print("Loaded model_state_dict from checkpoint")
+            else:
+                unwrapped.load_state_dict(ckpt, strict=False)
+                accelerator.print("Loaded raw state_dict into model")
+
+            if isinstance(ckpt, dict) and ckpt.get('optimizer_state_dict') is not None and optimizer is not None:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                accelerator.print("Loaded optimizer state from checkpoint")
+
+            if (
+                isinstance(ckpt, dict)
+                and scheduler is not None
+                and isinstance(scheduler, dict)
+                and 'scheduler' in scheduler
+                and ckpt.get('scheduler_state_dict') is not None
+            ):
+                scheduler['scheduler'].load_state_dict(ckpt['scheduler_state_dict'])
+                accelerator.print("Loaded scheduler state from checkpoint")
+
+            if isinstance(ckpt, dict):
+                start_epoch = ckpt.get('epoch', 0) + 1
+                total_steps = ckpt.get('total_steps', 0)
+                top_k_checkpoints = ckpt.get('top_k_checkpoints', top_k_checkpoints)
+                accelerator.print(f"Resume state: epoch={start_epoch}, total_steps={total_steps}")
+
+    # Training loop.
     loguru_logger.info(f"Starting training for {args.num_epochs} epochs.")
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         epoch_start_time = time.time()
 
-        if train_dataloader is None: # Ensure train_dataloader is available
-            loguru_logger.error("Train dataloader is None. Skipping training epoch.")
+        if train_dataloader is None:
+            loguru_logger.error("Train dataloader is None. Skipping training.")
             break
 
         for step, batch in enumerate(train_dataloader):
-            if batch is None: # Handle cases where collate_fn_skip_none might return None
-                loguru_logger.warning(f"Skipping step {step} in epoch {epoch} due to empty batch after filtering.")
+            if batch is None:
+                loguru_logger.warning(f"Skipping step {step} in epoch {epoch}: empty batch.")
                 continue
 
-            # Learning rate warmup phase (applied per optimizer step)
+            # Per-step LR warmup.
             if config.TRAINER.WARMUP_STEP > 0 and total_steps < config.TRAINER.WARMUP_STEP:
                 if config.TRAINER.WARMUP_TYPE == 'linear':
                     base_lr = config.TRAINER.WARMUP_RATIO * config.TRAINER.TRUE_LR
                     current_lr_scale = total_steps / config.TRAINER.WARMUP_STEP
-                    # For each param group, scale its target LR by current_lr_scale during warmup
                     for pg_idx, pg in enumerate(optimizer.param_groups):
-                        # The 'lr' in param_groups is the target LR for that group
                         target_lr_for_group = param_groups[pg_idx]['lr'] if param_groups else config.TRAINER.TRUE_LR
                         pg['lr'] = base_lr + current_lr_scale * abs(target_lr_for_group - base_lr)
-                # Add other warmup types (e.g., 'cosine') if necessary
 
-            # Forward and backward pass with gradient accumulation
-            # accelerator.accumulate handles gradient synchronization and accumulation.
             with accelerator.accumulate(model):
-                # _trainval_inference performs forward pass, computes loss, and updates 'batch'
                 model_handler._trainval_inference(batch)
                 loss = batch['loss']
                 loss_scalars = batch['loss_scalars']
 
                 accelerator.backward(loss)
 
-                # Gradient clipping and optimizer step occur only when gradients are synchronized
                 if accelerator.sync_gradients:
                     if config.TRAINER.GRADIENT_CLIPPING > 0:
                         accelerator.clip_grad_norm_(model.parameters(), config.TRAINER.GRADIENT_CLIPPING)
 
                     optimizer.step()
                     optimizer.zero_grad()
-                    total_steps += 1 # Increment total_steps only when optimizer.step() is called
+                    total_steps += 1
 
-            # Step-wise learning rate scheduler (if configured and gradients were synchronized)
             if scheduler is not None and scheduler['interval'] == 'step' and accelerator.sync_gradients:
-                 scheduler['scheduler'].step()
+                scheduler['scheduler'].step()
 
             # Log training metrics (on main process only)
             if total_steps > 0 and total_steps % args.log_every_n_steps == 0 and accelerator.is_main_process:
@@ -574,14 +589,21 @@ def main():
 
         # --- Save Checkpoint (on main process only) ---
         if epoch % args.save_every_n_epochs == 0 and accelerator.is_main_process:
-            save_dir = run_specific_output_dir # Use run-specific directory
-            # save_dir.mkdir(parents=True, exist_ok=True) # Already created at the start by main process
+            save_dir = run_specific_output_dir
             ckpt_filename = f"epoch_{epoch}_step_{total_steps}.ckpt"
             save_path = save_dir / ckpt_filename
 
             unwrapped_model = accelerator.unwrap_model(model)
-            accelerator.save(unwrapped_model.state_dict(), str(save_path))
-            accelerator.print(f"Saved checkpoint (model weights) to {save_path}")
+            ckpt_dict = {
+                'model_state_dict': unwrapped_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+                'scheduler_state_dict': scheduler['scheduler'].state_dict() if scheduler is not None and isinstance(scheduler, dict) and 'scheduler' in scheduler else None,
+                'epoch': epoch,
+                'total_steps': total_steps,
+                'top_k_checkpoints': top_k_checkpoints,
+            }
+            accelerator.save(ckpt_dict, str(save_path))
+            accelerator.print(f"Saved checkpoint: {save_path}")
 
     # --- End of Training ---
     if accelerator.is_main_process:

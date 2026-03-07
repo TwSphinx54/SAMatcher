@@ -4,6 +4,8 @@ from typing import List
 import src.utils.misc as misc
 from torch.nn import functional as F
 from src.utils.utils import box_xyxy_to_cxywh, bbox_oiou
+import matplotlib.pyplot as plt
+import os
 
 class IouOverlapLoss(nn.Module):
     """IoU-based loss for bounding box regression."""
@@ -72,13 +74,17 @@ def create_box_mask(boxes, mask_shape, device):
 
 
 def region_aware_mask_loss(pred_masks, gt_masks, pred_boxes, num_masks, 
-                          in_box_weight=2.0, out_box_weight=0.5):
+                          in_box_weight=2.0, out_box_weight=0.5, visualize=False, save_dir=None):
     """Compute region-aware mask loss with proper normalization."""
     h, w = pred_masks.shape[2], pred_masks.shape[3]
     
     # Create weighted masks: higher weight inside box, lower outside
     box_masks = create_box_mask(pred_boxes, (h, w), pred_masks.device)
     weight_masks = box_masks * in_box_weight + (1 - box_masks) * out_box_weight
+    
+    # Visualization code
+    if visualize:
+        visualize_weight_masks(weight_masks, pred_masks, gt_masks, pred_boxes, save_dir)
     
     # Flatten for loss computation
     pred_flat = pred_masks.sigmoid().flatten(1)
@@ -98,6 +104,122 @@ def region_aware_mask_loss(pred_masks, gt_masks, pred_boxes, num_masks,
     dice_loss = 1 - (2 * intersection + 1) / (pred_weighted + gt_weighted + 1)
     
     return normalized_bce.sum() / num_masks, dice_loss.sum() / num_masks
+
+
+def visualize_weight_masks(weight_masks, pred_masks, gt_masks, pred_boxes, save_dir=None):
+    """Visualize weight masks for each sample in the batch."""
+    if save_dir is None:
+        save_dir = "./weight_mask_visualizations"
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    batch_size = weight_masks.shape[0]
+    
+    for i in range(batch_size):
+        # Convert tensors to numpy for visualization
+        weight_mask = weight_masks[i].detach().cpu().numpy()
+        pred_mask = pred_masks[i, 0].sigmoid().detach().cpu().numpy()
+        gt_mask = gt_masks[i, 0].detach().cpu().numpy()
+        
+        # Get box coordinates
+        x1, y1, x2, y2 = pred_boxes[i].detach().cpu().numpy()
+        
+        # Create visualization
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f'Sample {i} - Weight Mask Visualization', fontsize=16)
+        
+        # 1. Weight mask
+        im1 = axes[0, 0].imshow(weight_mask, cmap='viridis', interpolation='nearest')
+        axes[0, 0].set_title('Weight Mask')
+        axes[0, 0].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                         fill=False, edgecolor='red', linewidth=2))
+        plt.colorbar(im1, ax=axes[0, 0], fraction=0.046, pad=0.04)
+        
+        # 2. Predicted mask
+        im2 = axes[0, 1].imshow(pred_mask, cmap='gray', interpolation='nearest')
+        axes[0, 1].set_title('Predicted Mask')
+        axes[0, 1].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                         fill=False, edgecolor='red', linewidth=2))
+        plt.colorbar(im2, ax=axes[0, 1], fraction=0.046, pad=0.04)
+        
+        # 3. Ground truth mask
+        im3 = axes[1, 0].imshow(gt_mask, cmap='gray', interpolation='nearest')
+        axes[1, 0].set_title('Ground Truth Mask')
+        axes[1, 0].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                         fill=False, edgecolor='red', linewidth=2))
+        plt.colorbar(im3, ax=axes[1, 0], fraction=0.046, pad=0.04)
+        
+        # 4. Weight distribution histogram
+        axes[1, 1].hist(weight_mask.flatten(), bins=50, alpha=0.7, edgecolor='black')
+        axes[1, 1].set_title('Weight Distribution')
+        axes[1, 1].set_xlabel('Weight Value')
+        axes[1, 1].set_ylabel('Frequency')
+        axes[1, 1].axvline(weight_mask.mean(), color='red', linestyle='--', 
+                          label=f'Mean: {weight_mask.mean():.3f}')
+        axes[1, 1].legend()
+        
+        # Add text info
+        info_text = f'Box: ({x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f})\n'
+        info_text += f'Weight range: [{weight_mask.min():.2f}, {weight_mask.max():.2f}]\n'
+        info_text += f'In-box pixels: {(weight_mask == weight_mask.max()).sum()}\n'
+        info_text += f'Out-box pixels: {(weight_mask == weight_mask.min()).sum()}'
+        
+        fig.text(0.02, 0.02, info_text, fontsize=10, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f'weight_mask_sample_{i}.png'), 
+                   dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    print(f"Weight mask visualizations saved to: {save_dir}")
+
+
+def visualize_weight_masks_single_plot(weight_masks, pred_masks, gt_masks, pred_boxes, save_dir=None):
+    """Visualize all weight masks in a single plot for comparison."""
+    if save_dir is None:
+        save_dir = "./weight_mask_visualizations"
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    batch_size = weight_masks.shape[0]
+    cols = min(4, batch_size)
+    rows = (batch_size + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
+    if batch_size == 1:
+        axes = [axes]
+    elif rows == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    for i in range(batch_size):
+        weight_mask = weight_masks[i].detach().cpu().numpy()
+        x1, y1, x2, y2 = pred_boxes[i].detach().cpu().numpy()
+        
+        im = axes[i].imshow(weight_mask, cmap='viridis', interpolation='nearest')
+        axes[i].set_title(f'Sample {i}')
+        axes[i].add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
+                                       fill=False, edgecolor='red', linewidth=2))
+        plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+        
+        # Add weight range text
+        axes[i].text(0.02, 0.98, f'Range: [{weight_mask.min():.2f}, {weight_mask.max():.2f}]',
+                    transform=axes[i].transAxes, fontsize=8,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                    verticalalignment='top')
+    
+    # Hide empty subplots
+    for i in range(batch_size, len(axes)):
+        axes[i].set_visible(False)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'weight_masks_batch_overview.png'), 
+               dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Batch weight mask overview saved to: {save_dir}")
 
 
 def oiou_loss(pred, target, eps=1e-7):
@@ -217,18 +339,6 @@ def calculate_uncertainty(logits):
     return -(torch.abs(gt_class_logits))
 
 
-def morphological_resize_masks(masks, target_size, kernel_size=3):
-    """Resize masks with morphological smoothing to preserve structure."""
-    # Bilinear resize followed by morphological closing
-    resized_masks = F.interpolate(masks, size=target_size, mode='bilinear', align_corners=False)
-    
-    padding = kernel_size // 2
-    dilated = F.max_pool2d(resized_masks, kernel_size, stride=1, padding=padding)
-    closed = -F.max_pool2d(-dilated, kernel_size, stride=1, padding=padding)
-    
-    return closed
-
-
 def loss_masks(src_masks, target_masks, num_masks, oversample_ratio=3.0):
     """Compute point-based mask losses using uncertainty sampling."""
     with torch.no_grad():
@@ -259,7 +369,7 @@ def loss_masks(src_masks, target_masks, num_masks, oversample_ratio=3.0):
     return loss_mask, loss_dice
 
 
-def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_config=None):
+def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_config=None, visualize_weights=False):
     """
     Compute Mask-Centric joint optimization loss with proper coordinate handling.
     
@@ -268,6 +378,7 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
         mask_box_weight_ratio: Weight ratio between mask loss and box loss
         box_loss_weights: Dict with weights for different box loss components
         mask_loss_config: Dict with configuration for mask loss
+        visualize_weights: Whether to visualize weight masks
     """
     if box_loss_weights is None:
         box_loss_weights = {
@@ -290,8 +401,8 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
     pred_mask = batch["pred_mask"]
     h_p, w_p = pred_mask.shape[2], pred_mask.shape[3]
     
-    # Apply morphological resizing to ground truth masks
-    gt_masks_r = morphological_resize_masks(gt_masks, target_size=(h_p, w_p), kernel_size=9)
+    # Resize ground truth masks to prediction resolution (pure bilinear, no morphology)
+    gt_masks_r = F.interpolate(gt_masks, size=(h_p, w_p), mode='bilinear', align_corners=False)
     
     # Get original mask dimensions
     h0, w0 = gt_masks[:, 0].shape[1], gt_masks[:, 0].shape[2]
@@ -305,7 +416,7 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
 
     pred_bbox_xyxy0, pred_bbox_xyxy1 = batch["boxes"]
     pred_bbox_cxywh0 = box_xyxy_to_cxywh(pred_bbox_xyxy0, max_h=h0, max_w=w0)
-    pred_bbox_cxywh1 = box_xyxy_to_cxywh(pred_bbox_xyxy1, max_h=h0, max_w=w0)
+    pred_bbox_cxywh1 = box_xyxy_to_cxywh(pred_bbox_xyxy1, max_h=h1, max_w=w1)
     
     # ===== MASK LOSS COMPUTATION =====
     
@@ -324,7 +435,7 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
     point_loss_dice = (point_loss_dice0 + point_loss_dice1) / 2
     original_mask_loss = point_loss_mask + point_loss_dice
     
-    # 2. Region-aware mask losses
+    # 2. Region-aware mask losses with visualization
     # Scale predicted boxes to mask resolution
     scale_x0, scale_y0 = w_p / w0, h_p / h0
     scale_x1, scale_y1 = w_p / w1, h_p / h1
@@ -338,7 +449,9 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
         scaled_pred_bbox0,
         len(pred_mask),
         mask_loss_config['in_box_weight'],
-        mask_loss_config['out_box_weight']
+        mask_loss_config['out_box_weight'],
+        visualize=visualize_weights,
+        save_dir=".data/visualizations/mask0_weights"
     )
     
     region_loss_mask1, region_loss_dice1 = region_aware_mask_loss(
@@ -347,7 +460,9 @@ def loss(batch, mask_box_weight_ratio=1.0, box_loss_weights=None, mask_loss_conf
         scaled_pred_bbox1,
         len(pred_mask),
         mask_loss_config['in_box_weight'],
-        mask_loss_config['out_box_weight']
+        mask_loss_config['out_box_weight'],
+        visualize=visualize_weights,
+        save_dir=".data/visualizations/mask1_weights"
     )
     
     region_mask_loss = (region_loss_mask0 + region_loss_mask1) / 2

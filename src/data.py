@@ -1,6 +1,7 @@
 import torch
 import random
 import numpy as np
+import math
 import os.path as osp
 from loguru import logger
 from collections import abc, defaultdict
@@ -240,6 +241,9 @@ class PreprocessedDataset(Dataset):
                  img_padding=False,
                  n_samples_per_subset=None,
                  seed=None,
+                 grid_patch_size=32,        # <--- new default patch size A
+                 grid_threshold=0.01,       # <--- new default threshold h
+                 debug_visual=False,        # <--- optional debug flag (not used by default)
                  **kwargs):
         super().__init__()
         self.data_root = data_root
@@ -250,6 +254,10 @@ class PreprocessedDataset(Dataset):
         self.mode = mode
         self.n_samples_per_subset = n_samples_per_subset
         self.seed = seed
+        # new grid params
+        self.grid_patch_size = grid_patch_size
+        self.grid_threshold = grid_threshold
+        self.debug_visual = debug_visual
         self.npz_rel_paths = []
 
         if not osp.exists(list_file_path):
@@ -363,13 +371,45 @@ class PreprocessedDataset(Dataset):
             if scale0[0].item() == 0 or scale0[1].item() == 0:
                 logger.warning(f"Zero scale factor for mask0 processing npz {npz_full_path}, skipping.")
                 return None
+
+            # use original mask tensor first
+            valid_mask0_orig_t = torch.from_numpy(valid_mask0_orig.astype(np.float32))
+            valid_mask1_orig_t = torch.from_numpy(valid_mask1_orig.astype(np.float32))
+
+            # compute grid on ORIGINAL masks (before any resize)
+            # --- gridify: compute grid-level valid patches from per-pixel masks (ORIGINAL RES) ---
+            logger.debug(f"Gridify on ORIGINAL masks (pre-resize), shapes: mask0={tuple(valid_mask0_orig_t.shape)}, mask1={tuple(valid_mask1_orig_t.shape)}")
+            def _compute_grid_mask(mask_2d, patch_size, threshold):
+                """
+                mask_2d: 2D float tensor (H, W) with 0..1 values
+                returns: uint8 tensor (h_cells, w_cells) with 1 for valid patch, 0 otherwise
+                """
+                H, W = mask_2d.shape
+                h_cells = (H + patch_size - 1) // patch_size
+                w_cells = (W + patch_size - 1) // patch_size
+                grid = torch.zeros((h_cells, w_cells), dtype=torch.uint8, device=mask_2d.device)
+                for i in range(h_cells):
+                    y0 = i * patch_size
+                    y1 = min((i + 1) * patch_size, H)
+                    for j in range(w_cells):
+                        x0 = j * patch_size
+                        x1 = min((j + 1) * patch_size, W)
+                        region = mask_2d[y0:y1, x0:x1]
+                        numel = region.numel()
+                        prop = float(region.sum().item()) / float(numel) if numel > 0 else 0.0
+                        if prop > threshold:
+                            grid[i, j] = 1
+                return grid
+
+            gt_grid0 = _compute_grid_mask(valid_mask0_orig_t, self.grid_patch_size, self.grid_threshold)
+            gt_grid1 = _compute_grid_mask(valid_mask1_orig_t, self.grid_patch_size, self.grid_threshold)
+
+            # continue with original -> intermediate mask resize for debug/consistency
             W0_intermediate = int(round(W0_orig / scale0[0].item()))
             H0_intermediate = int(round(H0_orig / scale0[1].item()))
-
-            valid_mask0_orig_t = torch.from_numpy(valid_mask0_orig.astype(np.float32))
             mask0_intermediate_t = F.interpolate(
-                valid_mask0_orig_t[None, None, :, :], 
-                size=(H0_intermediate, W0_intermediate), 
+                valid_mask0_orig_t[None, None, :, :],
+                size=(H0_intermediate, W0_intermediate),
                 mode='nearest'
             ).squeeze().float()
 
@@ -378,15 +418,13 @@ class PreprocessedDataset(Dataset):
             else:
                 gt_mask0_t = torch.zeros((H0_proc, W0_proc), dtype=torch.float32, device=image0.device)
                 gt_mask0_t[0:H0_intermediate, 0:W0_intermediate] = mask0_intermediate_t
-            
+
             H1_orig, W1_orig = valid_mask1_orig.shape
             if scale1[0].item() == 0 or scale1[1].item() == 0:
                 logger.warning(f"Zero scale factor for mask1 processing npz {npz_full_path}, skipping.")
                 return None
             W1_intermediate = int(round(W1_orig / scale1[0].item()))
             H1_intermediate = int(round(H1_orig / scale1[1].item()))
-
-            valid_mask1_orig_t = torch.from_numpy(valid_mask1_orig.astype(np.float32))
             mask1_intermediate_t = F.interpolate(
                 valid_mask1_orig_t[None, None, :, :],
                 size=(H1_intermediate, W1_intermediate),
@@ -404,29 +442,61 @@ class PreprocessedDataset(Dataset):
         except Exception as e:
             logger.warning(f"Error processing masks for npz {npz_full_path}, skipping: {e}")
             return None
-            
+
+        # --- map ORIGINAL grid masks to processed resolution ---
         try:
-            bbox0_orig_t = torch.from_numpy(bbox0_orig).float()
-            bbox1_orig_t = torch.from_numpy(bbox1_orig).float()
-            
-            if scale0[0].item() == 0 or scale0[1].item() == 0 or scale1[0].item() == 0 or scale1[1].item() == 0:
+            device = image0.device
+            def grid_to_processed_mask(grid, H_orig, W_orig, H_inter, W_inter, H_proc, W_proc, patch_size, pad_mask):
+                # from grid (original) -> pixel mask at original res
+                g = grid.to(dtype=torch.uint8, device=device)
+                g_up_orig = g.repeat_interleave(patch_size, dim=0).repeat_interleave(patch_size, dim=1)
+                g_up_orig = g_up_orig[:H_orig, :W_orig].float()
+                # resize to intermediate (scaled) size
+                g_inter = F.interpolate(g_up_orig[None, None], size=(H_inter, W_inter), mode='nearest').squeeze(0).squeeze(0)
+                if pad_mask is None:
+                    return g_inter
+                # pad to processed resolution
+                g_proc = torch.zeros((H_proc, W_proc), dtype=torch.float32, device=device)
+                g_proc[0:H_inter, 0:W_inter] = g_inter
+                return g_proc
+
+            g0_proc = grid_to_processed_mask(
+                gt_grid0, H0_orig, W0_orig, H0_intermediate, W0_intermediate, H0_proc, W0_proc, self.grid_patch_size, pad_mask0
+            )
+            g1_proc = grid_to_processed_mask(
+                gt_grid1, H1_orig, W1_orig, H1_intermediate, W1_intermediate, H1_proc, W1_proc, self.grid_patch_size, pad_mask1
+            )
+            gt_grid_masks_resized = torch.stack([g0_proc, g1_proc], dim=0).float()
+        except Exception as e:
+            logger.warning(f"Failed to rescale grid masks for npz {npz_full_path}: {e}")
+            # best-effort fallback to resized pixel masks
+            gt_grid_masks_resized = gt_masks
+
+        # --- map ORIGINAL bbox to processed resolution (resize + optional pad) ---
+        try:
+            sx0, sy0 = float(scale0[0].item()), float(scale0[1].item())
+            sx1, sy1 = float(scale1[0].item()), float(scale1[1].item())
+            if sx0 == 0.0 or sy0 == 0.0 or sx1 == 0.0 or sy1 == 0.0:
                 logger.warning(f"Zero scale factor encountered for npz {npz_full_path}, skipping bbox processing.")
                 return None
 
-            inv_scale0_tensor = torch.tensor([1.0/scale0[0].item(), 1.0/scale0[1].item(), 1.0/scale0[0].item(), 1.0/scale0[1].item()], dtype=torch.float32)
-            inv_scale1_tensor = torch.tensor([1.0/scale1[0].item(), 1.0/scale1[1].item(), 1.0/scale1[0].item(), 1.0/scale1[1].item()], dtype=torch.float32)
-            
-            bbox0_t = bbox0_orig_t * inv_scale0_tensor
-            bbox1_t = bbox1_orig_t * inv_scale1_tensor
+            bbox0_orig_t = torch.as_tensor(bbox0_orig, dtype=torch.float32)
+            bbox1_orig_t = torch.as_tensor(bbox1_orig, dtype=torch.float32)
 
-            bbox0_t[0::2].clamp_(min=0, max=W0_proc - 1) 
-            bbox0_t[1::2].clamp_(min=0, max=H0_proc - 1) 
-            bbox1_t[0::2].clamp_(min=0, max=W1_proc - 1) 
-            bbox1_t[1::2].clamp_(min=0, max=H1_proc - 1) 
+            inv_scale0 = torch.tensor([1.0/sx0, 1.0/sy0, 1.0/sx0, 1.0/sy0], dtype=torch.float32)
+            inv_scale1 = torch.tensor([1.0/sx1, 1.0/sy1, 1.0/sx1, 1.0/sy1], dtype=torch.float32)
+
+            bbox0_t = bbox0_orig_t * inv_scale0
+            bbox1_t = bbox1_orig_t * inv_scale1
+
+            # clamp to processed image bounds (padding, if any, is top-left anchored)
+            bbox0_t[0::2].clamp_(min=0, max=W0_proc - 1)
+            bbox0_t[1::2].clamp_(min=0, max=H0_proc - 1)
+            bbox1_t[0::2].clamp_(min=0, max=W1_proc - 1)
+            bbox1_t[1::2].clamp_(min=0, max=H1_proc - 1)
 
             bbox0 = bbox0_t.long()
             bbox1 = bbox1_t.long()
-
         except Exception as e:
             logger.warning(f"Error processing bounding boxes for npz {npz_full_path}, skipping: {e}")
             return None
@@ -434,9 +504,150 @@ class PreprocessedDataset(Dataset):
         data = {
             'image0': image0,
             'image1': image1,
-            'gt_masks': gt_masks,
+            # 'gt_masks': gt_masks,
+            'gt_masks': gt_grid_masks_resized,
+            # 'gt_grid_masks': gt_grid_masks_resized,
             'bbox0': bbox0,
             'bbox1': bbox1,
             'overlap_score': torch.tensor(overlap_score, dtype=torch.float32)
         }
+
+        # -------------------------
+        # Debug visualization block
+        # -------------------------
+        # Uncomment / enable to save visualization files to '.' for inspection.
+        # The block is intentionally commented / inert by default to avoid runtime overhead.
+        
+        # Example: set `self.debug_visual = True` or replace `if False` by `if self.debug_visual`
+        
+        if self.debug_visual:
+            try:
+                import numpy as _np
+                from PIL import Image, ImageDraw, ImageFont
+                import os
+                os.makedirs('.', exist_ok=True)
+                os.makedirs('outputs/debug', exist_ok=True)
+
+                # --- prepare images as H x W x C uint8 ---
+                def to_uint8(img_tensor):
+                    img_np = img_tensor.detach().cpu().permute(1, 2, 0).numpy()
+                    if img_np.max() <= 1.0:
+                        img_vis = (_np.clip(img_np, 0, 1) * 255).astype(_np.uint8)
+                    else:
+                        img_vis = _np.clip(img_np, 0, 255).astype(_np.uint8)
+                    # ensure 3 channels
+                    if img_vis.ndim == 2:
+                        img_vis = _np.stack([img_vis]*3, axis=2)
+                    if img_vis.shape[2] == 1:
+                        img_vis = _np.repeat(img_vis, 3, axis=2)
+                    return img_vis
+
+                img0_vis = to_uint8(image0)
+                img1_vis = to_uint8(image1)
+
+                mask0_np = gt_mask0_t.detach().cpu().numpy()
+                mask1_np = gt_mask1_t.detach().cpu().numpy()
+
+                # processed-resolution grid masks for overlay
+                grid0_up = gt_grid_masks_resized[0].detach().cpu().numpy()
+                grid1_up = gt_grid_masks_resized[1].detach().cpu().numpy()
+
+                # overlay mask with color and alpha
+                def overlay_mask_color(img_uint8, mask, color=(255,0,0), alpha=0.5):
+                    img = img_uint8.astype(_np.float32)
+                    color_arr = _np.array(color, dtype=_np.float32).reshape(1,1,3)
+                    m = _np.clip(mask, 0.0, 1.0)
+                    if m.ndim == 2:
+                        m3 = m[:,:,None]
+                    else:
+                        m3 = m
+                    out = (img * (1.0 - m3 * alpha) + color_arr * (m3 * alpha))
+                    out = _np.clip(out, 0, 255).astype(_np.uint8)
+                    return out
+
+                # apply overlays (pixel mask in red)
+                img0_over = overlay_mask_color(img0_vis, mask0_np, color=(255,0,0), alpha=0.6)
+                img1_over = overlay_mask_color(img1_vis, mask1_np, color=(255,0,0), alpha=0.6)
+
+                # overlay processed grid as semi-transparent yellow
+                img0_over = overlay_mask_color(img0_over, grid0_up, color=(255,255,0), alpha=0.35)
+                img1_over = overlay_mask_color(img1_over, grid1_up, color=(255,255,0), alpha=0.35)
+
+                # ensure same height by padding shorter image vertically
+                h0, w0 = img0_over.shape[0], img0_over.shape[1]
+                h1, w1 = img1_over.shape[0], img1_over.shape[1]
+                H = max(h0, h1)
+                def pad_to_height(img, H):
+                    h, w = img.shape[0], img.shape[1]
+                    if h == H:
+                        return img
+                    pad = _np.zeros((H - h, w, 3), dtype=_np.uint8)
+                    return _np.vstack([img, pad])
+                img0_pad = pad_to_height(img0_over, H)
+                img1_pad = pad_to_height(img1_over, H)
+
+                # concatenate horizontally
+                pair_img = _np.hstack([img0_pad, img1_pad])
+
+                # draw paths as labels on each subimage using PIL
+                pil = Image.fromarray(pair_img)
+                draw = ImageDraw.Draw(pil)
+                try:
+                    font = ImageFont.load_default()
+                except Exception:
+                    font = None
+
+                # draw bboxes on both images
+                try:
+                    b0 = [int(v) for v in bbox0.detach().cpu().tolist()]
+                    b1 = [int(v) for v in bbox1.detach().cpu().tolist()]
+                    # left image bbox
+                    draw.rectangle([b0[0], b0[1], b0[2], b0[3]], outline=(0, 255, 0), width=2)
+                    # right image bbox (offset by w0)
+                    draw.rectangle([b1[0] + w0, b1[1], b1[2] + w0, b1[3]], outline=(0, 255, 0), width=2)
+                except Exception as _be:
+                    logger.warning(f"Failed to draw bboxes for idx={idx}: {_be}")
+
+                # annotate img_path0_rel and img_path1_rel on left/top of each subimage
+                txt_margin = 6
+                # background rectangle for readability + text
+                def get_text_size(draw_obj, text, font):
+                    # Try multiple methods for compatibility across PIL versions
+                    try:
+                        # Pillow >= 8.0
+                        bbox = draw_obj.textbbox((0, 0), text, font=font)
+                        return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+                    except Exception:
+                        pass
+                    try:
+                        # Older Pillow
+                        return draw_obj.textsize(text, font=font)
+                    except Exception:
+                        pass
+                    try:
+                        # Fallback to font
+                        return font.getsize(text)
+                    except Exception:
+                        # Last resort: estimate width ~6px per char, height ~11px
+                        return (max(10, len(text) * 6), 11)
+
+                def draw_label(draw_obj, text, x, y, font, fill=(255,255,255), bg=(0,0,0)):
+                    if font is None:
+                        font = ImageFont.load_default()
+                    tw, th = get_text_size(draw_obj, text, font)
+                    # solid rectangle background for readability
+                    draw_obj.rectangle([x - 2, y - 2, x + tw + 2, y + th + 2], fill=(0, 0, 0))
+                    draw_obj.text((x, y), text, font=font, fill=fill)
+
+                # left image label
+                left_label = img_path0_rel if isinstance(img_path0_rel, str) else str(img_path0_rel)
+                right_label = img_path1_rel if isinstance(img_path1_rel, str) else str(img_path1_rel)
+                draw_label(draw, left_label, txt_margin, txt_margin, font)
+                draw_label(draw, right_label, w0 + txt_margin, txt_margin, font)
+
+                out_path = f'outputs/debug/debug_npz_{idx}_pair.png'
+                pil.save(out_path, format='PNG')
+            except Exception as _e:
+                logger.warning(f"Failed to save debug visualization for idx={idx}: {_e}")
+
         return data

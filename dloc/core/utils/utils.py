@@ -11,6 +11,7 @@ import matplotlib
 import numpy as np
 import torch
 from matplotlib import pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
 
 matplotlib.use('Agg')
 
@@ -74,7 +75,7 @@ class VideoStreamer:
         self._ip_camera = False
         self._ip_image = None
         self._ip_index = 0
-        
+
         # Initialize general variables
         self.cap = []
         self.camera = True
@@ -85,13 +86,13 @@ class VideoStreamer:
         self.i = 0
         self.skip = skip
         self.max_length = max_length
-        
-        # Determine input type and initialize accordingly
-        if isinstance(basedir, int) or basedir.isdigit():
+
+        # Safe checks for basedir type
+        if isinstance(basedir, int) or (isinstance(basedir, str) and basedir.isdigit()):
             print('==> Processing USB webcam input: {}'.format(basedir))
             self.cap = cv2.VideoCapture(int(basedir))
             self.listing = range(0, self.max_length)
-        elif basedir.startswith(('http', 'rtsp')):
+        elif isinstance(basedir, str) and basedir.startswith(('http', 'rtsp')):
             print('==> Processing IP camera input: {}'.format(basedir))
             self.cap = cv2.VideoCapture(basedir)
             self.start_ip_camera_thread()
@@ -124,7 +125,7 @@ class VideoStreamer:
         else:
             raise ValueError(
                 'VideoStreamer input "{}" not recognized.'.format(basedir))
-        
+
         if self.camera and not self.cap.isOpened():
             raise IOError('Could not read camera')
 
@@ -142,7 +143,7 @@ class VideoStreamer:
         """Return the next frame, and increment internal counter."""
         if self.i == self.max_length:
             return (None, False)
-        
+
         if self.camera:
             if self._ip_camera:
                 # Wait for first image, making sure we haven't exited
@@ -154,11 +155,11 @@ class VideoStreamer:
                     self._ip_running = False
             else:
                 ret, image = self.cap.read()
-            
+
             if ret is False:
                 print('VideoStreamer: Cannot get image from camera')
                 return (None, False)
-            
+
             w, h = image.shape[1], image.shape[0]
             if self.video_file:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.listing[self.i])
@@ -169,7 +170,7 @@ class VideoStreamer:
         else:
             image_file = str(self.listing[self.i])
             image = self.load_image(image_file)
-        
+
         self.i = self.i + 1
         return (image, True)
 
@@ -230,78 +231,95 @@ def read_overlap_image(
     grayscale=False,
     align='disk',
     overlap=False,
+    pad_square=True,
 ):
-    """Read image with overlap processing capabilities."""
+    """Read image, apply stride-aligned resize, optional square padding, and build tensors."""
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    is_rgb = False
     if not align:
-        image = image[:, :, ::-1]  # BGR to RGB
+        image = image[:, :, ::-1]  # BGR -> RGB
+        is_rgb = True
     if image is None:
         return None, None, None
-    
+
     image = image.astype(np.float32)
     w, h = image.shape[:2][::-1]
-    
-    # Determine new dimensions based on alignment requirements
+
+    # Infer stride from align mode.
     if align == 'disk':
-        w_new = math.ceil(w / 32) * 32
-        h_new = math.ceil(h / 32) * 32
+        step = 16
     elif align == 'loftr':
-        w_new = math.ceil(w / 8) * 8
-        h_new = math.ceil(h / 8) * 8
+        step = 8
     else:
-        w_new, h_new = process_resize(w, h, [-1])
+        step = 1
 
-    if overlap:
-        if len(resize) == 1 and resize[0] == -1:
-            w_new_overlap, h_new_overlap = w, h
-        else:
-            w_new_overlap, h_new_overlap = resize[0], resize[0]
+    # 1) Resize by long side or explicit size.
+    if len(resize) == 1 and resize[0] > -1:
+        target = int(resize[0])
+        scale = target / max(h, w)
+        w_r, h_r = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    elif len(resize) == 1 and resize[0] == -1:
+        w_r, h_r = w, h
     else:
-        w_new, h_new = process_resize(w, h, resize)
+        w_r, h_r = int(resize[0]), int(resize[1])
 
+    # 2) Align resized content to stride.
+    w_new = int(math.ceil(w_r / step) * step)
+    h_new = int(math.ceil(h_r / step) * step)
+
+    # 3) Map aligned content coordinates back to original image coordinates.
     scales = (float(w) / float(w_new), float(h) / float(h_new))
-    if overlap:
-        overlap_scales = (
-            float(w_new) / float(w_new_overlap),
-            float(h_new) / float(h_new_overlap),
-        )
 
-    # Resize image based on float precision requirement
+    # 4) Resize to aligned content size.
     if resize_float:
-        image = cv2.resize(image.astype('float32'), (w_new, h_new))
-        if overlap:
-            overlap_image = cv2.resize(image.astype('float32'),
-                                       (w_new_overlap, h_new_overlap))
+        img_resized = cv2.resize(image.astype('float32'), (w_new, h_new))
     else:
-        image = cv2.resize(image, (w_new, h_new)).astype('float32')
-        if overlap:
-            overlap_image = cv2.resize(image.astype('float32'),
-                                       (w_new_overlap, h_new_overlap))
+        img_resized = cv2.resize(image, (w_new, h_new)).astype('float32')
 
-    # Apply rotation if specified
+    # 5) Optional square padding at bottom/right.
+    if pad_square:
+        pad_size = max(w_new, h_new)
+        if pad_size == w_new and pad_size == h_new:
+            img_for_inp = img_resized
+        else:
+            padded = np.zeros((pad_size, pad_size, image.shape[2]), dtype=img_resized.dtype)
+            padded[:h_new, :w_new, :] = img_resized
+            img_for_inp = padded
+    else:
+        img_for_inp = img_resized
+
+    if overlap:
+        overlap_image = img_for_inp.copy()
+
+    # 6) Apply rotation.
     if rotation != 0:
-        image = np.rot90(image, k=rotation)
+        img_for_inp = np.rot90(img_for_inp, k=rotation)
+        if overlap:
+            overlap_image = np.rot90(overlap_image, k=rotation)
         if rotation % 2:
             scales = scales[::-1]
-    
-    # Process overlap image if needed
-    if overlap:
-        overlap_inp = overlap_image[None]
-        overlap_inp = torch.from_numpy(overlap_inp / 255.0).float().to(device)
 
-    # Convert to tensor format
+    # 7) Build tensors.
+    if overlap:
+        overlap_inp = torch.from_numpy(overlap_image[None] / 255.0).float().to(device)
+
+    # Always compute overlap scales from aligned content (padding does not change origin mapping).
+    overlap_scales = (float(w) / float(w_new), float(h) / float(h_new))
+    if rotation % 2:
+        overlap_scales = overlap_scales[::-1]
+
+    # Keep visualization output in RGB.
+    out_vis = img_for_inp if is_rgb else cv2.cvtColor(img_for_inp, cv2.COLOR_BGR2RGB)
+
     if grayscale:
-        image_g = image.copy()
-        image_g = cv2.cvtColor(image_g, cv2.COLOR_BGR2GRAY)
-        inp = image_g[None, None]
+        image_g = cv2.cvtColor(img_for_inp.copy(), cv2.COLOR_BGR2GRAY)
+        inp = torch.from_numpy(image_g[None, None] / 255.0).float().to(device)
     else:
-        inp = image.transpose((2, 0, 1))[None]
-    inp = torch.from_numpy(inp / 255.0).float().to(device)
+        inp = torch.from_numpy(img_for_inp.transpose((2, 0, 1))[None] / 255.0).float().to(device)
 
     if overlap:
-        return image, overlap_inp, inp, scales, overlap_scales
-    else:
-        return image, inp, scales
+        return out_vis, overlap_inp, inp, scales, overlap_scales
+    return out_vis, inp, scales
 
 
 def resize_pad_images(
@@ -324,7 +342,7 @@ def resize_pad_images(
     h, w, c = image.shape
     scale_factor = min(scale[0] / w, scale[1] / h)
     new_size = int(w * scale_factor + 0.5), int(h * scale_factor + 0.5)
-    
+
     # Resize with appropriate precision
     if resize_float:
         img_resize = cv2.resize(image.astype('float32'), new_size)
@@ -340,14 +358,14 @@ def resize_pad_images(
     overlap_inp = np.zeros((pad_scale[1], pad_scale[0], c), dtype=image.dtype)
     overlap_inp[:img_resize.shape[0], :img_resize.shape[1], :] = img_resize
     overlap_inp = overlap_inp[None]
-    
+
     # Create mask for valid regions
     mask = np.zeros(
         (int(pad_scale[1] / size_divisor), int(pad_scale[0] / size_divisor)),
         dtype=bool)
     mask[:int(img_resize.shape[0] / size_divisor), :int(img_resize.shape[1] /
                                                         size_divisor), ] = True
-    
+
     # Convert to tensor format
     if grayscale:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -355,11 +373,11 @@ def resize_pad_images(
     else:
         inp = image.transpose((2, 0, 1))[None]  # HxWxC to CxHxW
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
+
     inp = torch.from_numpy(inp / 255.0).float().to(device)
     overlap_inp = torch.from_numpy(overlap_inp / 255.0).float().to(device)
     mask = torch.from_numpy(mask)[None].float().to(device)
-    
+
     return (
         image,
         overlap_inp,
@@ -378,59 +396,88 @@ def read_image(
         grayscale=False,
         align='disk',
         overlap=False,
+        pad_square=False,  # Optional square padding; default preserves legacy behavior.
 ):
-    """Read and process image with various options."""
+    """Read image with stride-aligned resize, optional square padding, and tensor conversion."""
     if grayscale:
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        is_rgb = True
     else:
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        # track if we've converted to RGB already
+        is_rgb = False
         if not align:
             image = image[:, :, ::-1]  # BGR to RGB
-    
+            is_rgb = True
+
     if image is None:
         return None, None, None
-    
+
     image = image.astype(np.float32)
     w, h = image.shape[:2][::-1]
-    w_new, h_new = process_resize(w, h, resize)
-    
-    # Align dimensions based on model requirements
-    if align == 'disk':
-        w_new = math.ceil(w_new / 16) * 16
-        h_new = math.ceil(h_new / 16) * 16
-    elif align == 'loftr':
-        w_new = math.ceil(w_new / 8) * 8
-        h_new = math.ceil(h_new / 8) * 8
 
+    # Infer stride from align mode.
+    if align == 'disk':
+        step = 16
+    elif align == 'loftr':
+        step = 8
+    else:
+        step = 1
+
+    # Resize by long side when resize=[target], otherwise use legacy resize behavior.
+    if len(resize) == 1 and resize[0] > -1:
+        target = int(resize[0])
+        scale = target / max(h, w)
+        w_r, h_r = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    else:
+        w_r, h_r = process_resize(w, h, resize)
+
+    # Align content size to stride.
+    w_new = int(math.ceil(w_r / step) * step)
+    h_new = int(math.ceil(h_r / step) * step)
     scales = (float(w) / float(w_new), float(h) / float(h_new))
 
-    # Resize with appropriate precision
+    # 4) 缩放到对齐后的内容尺寸
     if resize_float:
-        image = cv2.resize(image.astype('float32'), (w_new, h_new))
+        img_resized = cv2.resize(image.astype('float32'), (w_new, h_new))
     else:
-        image = cv2.resize(image, (w_new, h_new)).astype('float32')
+        img_resized = cv2.resize(image, (w_new, h_new)).astype('float32')
 
-    # Apply rotation if specified
+    # 5) 可选：右下方形 padding
+    if pad_square and (len(resize) == 1 and resize[0] > -1):
+        pad_size = max(w_new, h_new)
+        if pad_size != w_new or pad_size != h_new:
+            padded = np.zeros((pad_size, pad_size, image.shape[2]), dtype=img_resized.dtype)
+            padded[:h_new, :w_new, :] = img_resized
+            img_final = padded
+        else:
+            img_final = img_resized
+    else:
+        img_final = img_resized
+
+    # 6) 旋转
     if rotation != 0:
-        image = np.rot90(image, k=rotation)
+        img_final = np.rot90(img_final, k=rotation)
         if rotation % 2:
             scales = scales[::-1]
-    
-    # Convert to tensor format
+
+    # 7) 组装张量（保证 image_vis 始终为 RGB）
     if overlap:
-        inp = image[None]  # HxWxC to CxHxW
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        inp = img_final[None]
+        image_vis = cv2.cvtColor(img_final, cv2.COLOR_BGR2RGB) if not is_rgb else img_final
     else:
         if grayscale:
-            image_g = image.copy()
+            image_g = img_final.copy()
             image_g = cv2.cvtColor(image_g, cv2.COLOR_BGR2GRAY)
             inp = image_g[None, None]
+            image_vis = cv2.cvtColor(img_final, cv2.COLOR_BGR2RGB) if not is_rgb else img_final
         else:
-            inp = image.transpose((2, 0, 1))[None]  # HxWxC to CxHxW
-    inp = torch.from_numpy(inp / 255.0).float().to(device)
+            inp = img_final.transpose((2, 0, 1))[None]
+            image_vis = cv2.cvtColor(img_final, cv2.COLOR_BGR2RGB) if not is_rgb else img_final
 
-    return image, inp, scales
+    inp = torch.from_numpy(inp / 255.0).float().to(device)
+    return image_vis, inp, scales
 
 
 def overlap_crop(image1, bbox1, image2, bbox2):
@@ -440,7 +487,7 @@ def overlap_crop(image1, bbox1, image2, bbox2):
     w1, h1 = left.shape[:2][::-1]
     w2, h2 = right.shape[:2][::-1]
     ratio1, ratio2 = (1, 1), (1, 1)
-    
+
     # Normalize heights and adjust widths proportionally
     if h1 > h2:
         w_new = int(float(h1) / float(h2) * w2)
@@ -450,7 +497,7 @@ def overlap_crop(image1, bbox1, image2, bbox2):
         w_new = int(float(h2) / float(h1) * w1)
         left = cv2.resize(left.astype('float32'), (w_new, h2))
         ratio1 = float(h2) / float(h1)
-    
+
     return left, right, ratio1, ratio2
 
 
@@ -491,26 +538,29 @@ def tensor_overlap_crop(image1,
                         bbox2,
                         extractor_name,
                         size_divisor=1):
-    """Crop overlapping regions from tensor images and resize intelligently."""
+    """Crop tensor overlap regions and resize them with optional stride alignment."""
     bbox1 = bbox1[0].int()
     bbox2 = bbox2[0].int()
-    
+
+    origin_w1, origin_h1 = image1.shape[2:][::-1]
+    origin_w2, origin_h2 = image2.shape[2:][::-1]
+
     # Extract crop regions
     left = image1[0, :, bbox1[1]:bbox1[3], bbox1[0]:bbox1[2]]
     right = image2[0, :, bbox2[1]:bbox2[3], bbox2[0]:bbox2[2]]
 
     w1, h1 = left.shape[1:][::-1]
     w2, h2 = right.shape[1:][::-1]
-    
+
     # Choose larger crop as reference for resizing
-    crop_area1 = w1 * h1
-    crop_area2 = w2 * h2
-    
-    if crop_area1 >= crop_area2:
-        reference_w, reference_h = w1, h1
+    area1 = origin_w1 * origin_h1
+    area2 = origin_w2 * origin_h2
+
+    if area1 >= area2:
+        reference_w, reference_h = origin_w1, origin_h1
     else:
-        reference_w, reference_h = w2, h2
-    
+        reference_w, reference_h = origin_w2, origin_h2
+
     # Calculate resize ratios and new dimensions
     ratio1, new_w1, new_h1 = patch_resize(reference_w, reference_h, w1, h1, extractor_name)
     ratio2, new_w2, new_h2 = patch_resize(reference_w, reference_h, w2, h2, extractor_name)
@@ -530,7 +580,7 @@ def tensor_overlap_crop(image1,
         new_h1 = math.ceil(new_h1 / size_divisor) * size_divisor
         cv_left = cv2.resize(cv_left.astype('float32'), (new_w1, new_h1),
                              interpolation=cv2.INTER_CUBIC)
-        
+
         new_w2 = math.ceil(new_w2 / size_divisor) * size_divisor
         new_h2 = math.ceil(new_h2 / size_divisor) * size_divisor
         cv_right = cv2.resize(cv_right.astype('float32'), (new_w2, new_h2),
@@ -546,6 +596,9 @@ def tensor_overlap_crop(image1,
         left = torch.from_numpy(cv_left / 255).float().to(image1.device)[None]
         right = torch.from_numpy(cv_right / 255).float().to(image1.device)[None]
 
+    # Final resize ratio = final input size / original crop size (after alignment if used).
+    ratio1 = [[float(new_w1) / max(1.0, float(w1)), float(new_h1) / max(1.0, float(h1))]]
+    ratio2 = [[float(new_w2) / max(1.0, float(w2)), float(new_h2) / max(1.0, float(h2))]]
     return left[None], right[None], ratio1, ratio2
 
 
@@ -555,7 +608,7 @@ def visualize_overlap_crop(image1, bbox1, image2, bbox2, output=None):
     right = image2[bbox2[1]:bbox2[3], bbox2[0]:bbox2[2]]
     w1, h1 = left.shape[:2][::-1]
     w2, h2 = right.shape[:2][::-1]
-    
+
     # Normalize heights
     if h1 > h2:
         w_new = int(float(h1) / float(h2) * w2)
@@ -563,7 +616,8 @@ def visualize_overlap_crop(image1, bbox1, image2, bbox2, output=None):
     else:
         w_new = int(float(h2) / float(h1) * w1)
         left = cv2.resize(left.astype('float32'), (w_new, h2))
-    
+        ratio1 = float(h2) / float(h1)
+
     if output:
         plot_image_pair([left, right])
         plt.savefig(str(output), bbox_inches='tight', pad_inches=0)
@@ -574,10 +628,17 @@ def visualize_overlap_crop(image1, bbox1, image2, bbox2, output=None):
 
 def visualize_overlap(image1, bbox1, image2, bbox2, output=None):
     """Visualize overlap regions with bounding boxes."""
-    left = cv2.rectangle(image1, tuple(bbox1[0:2]), tuple(bbox1[2:]),
-                         (0, 0, 255), 7)
-    right = cv2.rectangle(image2, tuple(bbox2[0:2]), tuple(bbox2[2:]),
-                          (0, 0, 255), 7)
+    # work on copies, convert RGB->BGR for cv2 drawing, then back to RGB
+    img1 = _to_hwc_uint8(image1)
+    img2 = _to_hwc_uint8(image2)
+    # bgr1 = cv2.cvtColor(img1, cv2.COLOR_RGB2BGR)
+    # bgr2 = cv2.cvtColor(img2, cv2.COLOR_RGB2BGR)
+    bgr1 = img1
+    bgr2 = img2
+    cv2.rectangle(bgr1, tuple(bbox1[0:2]), tuple(bbox1[2:]), (255, 0, 0), 7)
+    cv2.rectangle(bgr2, tuple(bbox2[0:2]), tuple(bbox2[2:]), (255, 0, 0), 7)
+    left = cv2.cvtColor(bgr1, cv2.COLOR_BGR2RGB)
+    right = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
     if output:
         plot_image_pair([left, right])
         plt.savefig(str(output), bbox_inches='tight', pad_inches=0)
@@ -588,14 +649,16 @@ def visualize_overlap(image1, bbox1, image2, bbox2, output=None):
 
 def visualize_overlap_gt(image1, bbox1, gt1, image2, bbox2, gt2, output=None):
     """Visualize overlap regions with both predicted and ground truth boxes."""
-    left = cv2.rectangle(image1, tuple(bbox1[0:2]), tuple(bbox1[2:]),
-                         (255, 0, 0), 5)
-    right = cv2.rectangle(image2, tuple(bbox2[0:2]), tuple(bbox2[2:]),
-                          (255, 0, 0), 5)
-    left = cv2.rectangle(left, tuple(gt1[0:2]), tuple(gt1[2:]), (0, 255, 0), 5)
-    right = cv2.rectangle(right, tuple(gt2[0:2]), tuple(gt2[2:]), (0, 255, 0),
-                          5)
-
+    img1 = _to_hwc_uint8(image1)
+    img2 = _to_hwc_uint8(image2)
+    bgr1 = cv2.cvtColor(img1, cv2.COLOR_RGB2BGR)
+    bgr2 = cv2.cvtColor(img2, cv2.COLOR_RGB2BGR)
+    cv2.rectangle(bgr1, tuple(bbox1[0:2]), tuple(bbox1[2:]), (0, 0, 255), 5)
+    cv2.rectangle(bgr2, tuple(bbox2[0:2]), tuple(bbox2[2:]), (0, 0, 255), 5)
+    cv2.rectangle(bgr1, tuple(gt1[0:2]), tuple(gt1[2:]), (0, 255, 0), 5)
+    cv2.rectangle(bgr2, tuple(gt2[0:2]), tuple(gt2[2:]), (0, 255, 0), 5)
+    left = cv2.cvtColor(bgr1, cv2.COLOR_BGR2RGB)
+    right = cv2.cvtColor(bgr2, cv2.COLOR_BGR2RGB)
     if output:
         plot_image_pair([left, right])
         plt.savefig(str(output), bbox_inches='tight', pad_inches=0)
@@ -665,450 +728,776 @@ def pose_auc(errors, thresholds):
     return aucs
 
 
-# --- VISUALIZATION FUNCTIONS ---
+# --- VISUALIZATION HELPERS (CONSOLIDATED) ---
 
+def _to_hwc_uint8(img):
+    """Convert many image formats to HWC uint8 (safe)."""
+    if img is None:
+        return None
+    if torch.is_tensor(img):
+        img = img.detach().cpu().numpy()
+    img = np.array(img)
+    # handle batch dims
+    if img.ndim == 4:
+        img = img[0]
+    # CHW -> HWC
+    if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[-1] not in (1, 3):
+        img = np.transpose(img, (1, 2, 0))
+    # gray -> 3 channels
+    if img.ndim == 2:
+        img = np.stack([img, img, img], axis=-1)
+    if img.ndim == 3 and img.shape[-1] == 1:
+        img = np.repeat(img, 3, axis=-1)
+    # float -> uint8
+    if img.dtype.kind == 'f':
+        if img.max() <= 1.0:
+            img = (img * 255.0).round()
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    else:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    return img
+
+
+def apply_mask_overlay(image, mask, alpha=0.35, mask_color=(0, 0, 0)):
+    """Overlay a mask on an RGB image by darkening masked-out pixels (mask==0)."""
+    if image is None:
+        return image
+    img_u8 = _to_hwc_uint8(image)
+    img = img_u8.astype(np.float32) / 255.0
+    if mask is None:
+        return img_u8
+
+    if torch.is_tensor(mask):
+        mask_np = mask.detach().cpu().numpy()
+    else:
+        mask_np = np.array(mask)
+    mask_np = np.squeeze(mask_np).astype(np.float32)
+    if mask_np.max() > 1.0:
+        mask_np = mask_np / 255.0
+    mask_np = np.clip(mask_np, 0.0, 1.0)
+
+    binary_like = np.logical_or(np.isclose(mask_np, 0.0), np.isclose(mask_np, 1.0)).all()
+    if binary_like:
+        alpha = max(alpha, 0.70)
+
+    interp = cv2.INTER_NEAREST if binary_like else cv2.INTER_LINEAR
+
+    # Resize helper: preserve aspect ratio and pad bottom/right (content anchored top-left).
+    def _resize_pad_mask_top_left(m, target_h, target_w, interpolation):
+        mh, mw = m.shape[:2]
+        if mh <= 0 or mw <= 0:
+            return np.zeros((target_h, target_w), dtype=np.float32)
+        # aspect-preserving scale (like your image preprocessing)
+        s = min(float(target_w) / float(mw), float(target_h) / float(mh))
+        new_w = max(1, int(round(mw * s)))
+        new_h = max(1, int(round(mh * s)))
+        m_rs = cv2.resize(m, (new_w, new_h), interpolation=interpolation)
+        out = np.zeros((target_h, target_w), dtype=np.float32)
+        out[:new_h, :new_w] = m_rs
+        return out
+
+    if mask_np.shape != img.shape[:2]:
+        Ht, Wt = int(img.shape[0]), int(img.shape[1])
+        mh, mw = int(mask_np.shape[0]), int(mask_np.shape[1])
+        # For square-padded targets, avoid stretching: resize + top-left placement.
+        if Ht == Wt and (mh != Ht or mw != Wt):
+            mask_r = _resize_pad_mask_top_left(mask_np, Ht, Wt, interpolation=interp)
+        else:
+            mask_r = cv2.resize(mask_np, (Wt, Ht), interpolation=interp)
+    else:
+        mask_r = mask_np
+
+    mask_r = np.clip(mask_r, 0.0, 1.0)[..., None]  # 1=keep
+    inv = 1.0 - mask_r
+    color_layer = np.zeros_like(img)
+    color_layer[..., 0] = mask_color[0] / 255.0
+    color_layer[..., 1] = mask_color[1] / 255.0
+    color_layer[..., 2] = mask_color[2] / 255.0
+    out = (1.0 - alpha * inv) * img + (alpha * inv) * color_layer
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+
+def draw_small_label(img, label_text, font_size=12, padding=4):
+    """Draw a small black box with white text at top-left. Input/output: RGB uint8."""
+    if img is None:
+        return img
+    im = _to_hwc_uint8(img)
+    pil = Image.fromarray(im)
+    draw = ImageDraw.Draw(pil)
+    font = ImageFont.load_default()
+
+    if hasattr(draw, "textbbox"):
+        l, t, r, b = draw.textbbox((0, 0), label_text, font=font)
+        tw, th = (r - l), (b - t)
+    else:
+        tw, th = draw.textsize(label_text, font=font)
+
+    draw.rectangle([0, 0, tw + 2 * padding, th + 2 * padding], fill=(0, 0, 0))
+    draw.text((padding, padding), label_text, fill=(255, 255, 255), font=font)
+    return np.array(pil)
+
+
+def draw_bbox(img, box, score=None, gt_box=None, tag=True, background=False):
+    """Draw predicted/gt boxes on RGB image and return a new RGB image."""
+    if img is None:
+        return img
+    img_out = img.copy()
+    h_img, w_img = img_out.shape[:2]
+
+    x0 = int(round(float(box[0])))
+    y0 = int(round(float(box[1])))
+    x1 = int(round(float(box[2])))
+    y1 = int(round(float(box[3])))
+
+    x0 = max(0, min(w_img - 1, x0))
+    x1 = max(0, min(w_img - 1, x1))
+    y0 = max(0, min(h_img - 1, y0))
+    y1 = max(0, min(h_img - 1, y1))
+
+    if background:
+        mask = np.ones_like(img_out) * 255
+        mask[y0:y1, x0:x1, :] = img_out[y0:y1, x0:x1, :]
+        img_out = cv2.addWeighted(img_out, 0.6, mask, 0.4, 0)
+
+    cv2.rectangle(img_out, (x0, y0), (x1, y1), (255, 0, 0), 2)
+
+    if gt_box is not None and len(gt_box) >= 4:
+        gx0 = int(round(float(gt_box[0])))
+        gy0 = int(round(float(gt_box[1])))
+        gx1 = int(round(float(gt_box[2])))
+        gy1 = int(round(float(gt_box[3])))
+
+        gx0 = max(0, min(w_img - 1, gx0))
+        gx1 = max(0, min(w_img - 1, gx1))
+        gy0 = max(0, min(h_img - 1, gy0))
+        gy1 = max(0, min(h_img - 1, gy1))
+
+        cv2.rectangle(img_out, (gx0, gy0), (gx1, gy1), (200, 100, 0), 2)
+
+    # Optional text tag intentionally omitted for cleaner default rendering.
+    return img_out
+
+
+def get_foreground_mask(img_data, **kwargs):
+    """Thin wrapper to project's AdaptiveForegroundExtractor (keeps same signature)."""
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../../models/ImagePreprocess'))
+    try:
+        from adaptive_foreground_extractor import AdaptiveForegroundExtractor
+    except Exception as e:
+        raise ImportError("AdaptiveForegroundExtractor not found: %s" % e)
+    fg_extractor = AdaptiveForegroundExtractor()
+    method = kwargs.get('method_type', 'method1')
+    if method == 'method1':
+        return fg_extractor.method1(
+            img_data,
+            min_area_close=kwargs.get('min_area_close'),
+            close_ratio=kwargs.get('close_ratio'),
+            remain_connect_regions_num=kwargs.get('remain_connect_regions_num'),
+            min_area_deleting=kwargs.get('min_area_deleting'),
+            connectivity=kwargs.get('connectivity'),
+        )
+    elif method == 'method2':
+        return fg_extractor.method2(
+            img_data,
+            close_ratio=kwargs.get('close_ratio'),
+            min_area_close=kwargs.get('min_area_close'),
+            remain_connect_regions_num=kwargs.get('remain_connect_regions_num'),
+            min_area_deleting=kwargs.get('min_area_deleting'),
+            connectivity=kwargs.get('connectivity'),
+            flood_fill_seed_point=kwargs.get('flood_fill_seed_point'),
+            flood_fill_low_diff=kwargs.get('flood_fill_low_diff'),
+            flood_fill_up_diff=kwargs.get('flood_fill_up_diff'),
+        )
+    else:
+        raise ValueError("get_foreground_mask: unsupported method_type '%s'" % method)
+
+
+def make_matching_plot(
+        image0, image1, kpts0, kpts1, mkpts0, mkpts1, color, text, path,
+        bbox0=None, bbox1=None, mask0=None, mask1=None,
+        show_keypoints=False, fast_viz=False, opencv_display=False,
+        opencv_title='matches', small_text=None, label0=None, label1=None, margin=100,
+        crop_mask0=None, crop_mask1=None, match_keep=None, match_weights=None,
+        auto_crop_zero_pad=True,
+        covisualize=False,
+        covis_path_suffix='_covis',
+        covis_mask0=None,
+        covis_mask1=None,
+):
+    """
+    Render two images side-by-side with optional masks, boxes, keypoints and matches.
+    Optionally save an additional covisibility visualization.
+    """
+    img0 = _to_hwc_uint8(image0)
+    img1 = _to_hwc_uint8(image1)
+    # Assume inputs are already RGB; do NOT flip channels here.
+
+    # --- New: trim right/bottom zero-padding ---
+    def _trim_rb_zero(img):
+        if img.ndim == 3:
+            nz_rows = np.where(img.sum(axis=(1, 2)) > 0)[0]
+            nz_cols = np.where(img.sum(axis=(0, 2)) > 0)[0]
+        else:
+            nz_rows = np.where(img.sum(axis=1) > 0)[0]
+            nz_cols = np.where(img.sum(axis=0) > 0)[0]
+        if nz_rows.size and nz_cols.size:
+            rmax = int(nz_rows[-1]) + 1
+            cmax = int(nz_cols[-1]) + 1
+            return img[:rmax, :cmax]
+        return img
+
+    if auto_crop_zero_pad:
+        img0 = _trim_rb_zero(img0)
+        img1 = _trim_rb_zero(img1)
+
+    # apply global masks (mask interpreted as 1=valid)
+    if mask0 is not None:
+        img0 = apply_mask_overlay(img0, mask0, alpha=0.5, mask_color=(0, 0, 0))
+    if mask1 is not None:
+        img1 = apply_mask_overlay(img1, mask1, alpha=0.5, mask_color=(0, 0, 0))
+
+    # overlay crop masks inside bbox if provided
+    def _apply_crop_tint_in_bbox(img, crop_mask, bbox, color=(30, 180, 30), alpha=0.25):
+        if crop_mask is None or bbox is None:
+            return img
+        if torch.is_tensor(crop_mask):
+            cm_np = crop_mask.detach().cpu().numpy()
+        else:
+            cm_np = np.array(crop_mask)
+        cm_np = np.squeeze(cm_np).astype(np.float32)
+        if cm_np.max() > 1.0:
+            cm_np = cm_np / 255.0
+        cm_np = np.clip(cm_np, 0.0, 1.0)
+
+        x0,y0,x1,y1 = (bbox.detach().cpu().numpy().reshape(-1)[:4].astype(int)
+                        if torch.is_tensor(bbox) else np.array(bbox).reshape(-1)[:4].astype(int))
+        x0,y0 = max(0,x0), max(0,y0)
+        x1,y1 = min(img.shape[1],x1), min(img.shape[0],y1)
+        if x1 <= x0 or y1 <= y0:
+            return img
+        w_box, h_box = x1 - x0, y1 - y0
+
+        # --- NEW: crop_mask is derived from binary masks used for filtering -> keep it crisp ---
+        cm_r = cv2.resize(cm_np, (w_box, h_box), interpolation=cv2.INTER_NEAREST)
+        cm_r = np.clip(cm_r, 0.0, 1.0)[..., None]
+
+        tint = np.zeros((h_box, w_box, 3), dtype=np.float32)
+        tint[..., 0] = color[0] / 255.0
+        tint[..., 1] = color[1] / 255.0
+        tint[..., 2] = color[2] / 255.0
+        sub = img[y0:y1, x0:x1].astype(np.float32) / 255.0
+        out_sub = (1.0 - alpha * (1.0 - cm_r)) * sub + (alpha * (1.0 - cm_r)) * tint
+        out = img.copy()
+        out[y0:y1, x0:x1] = np.clip(out_sub * 255.0, 0, 255).astype(np.uint8)
+        return out
+
+    if crop_mask0 is not None and bbox0 is not None:
+        img0 = _apply_crop_tint_in_bbox(img0, crop_mask0, bbox0)
+    if crop_mask1 is not None and bbox1 is not None:
+        img1 = _apply_crop_tint_in_bbox(img1, crop_mask1, bbox1)
+
+    # draw labels
+    # if label0:
+    #     img0 = draw_small_label(img0, label0, font_size=12)
+    # if label1:
+    #     img1 = draw_small_label(img1, label1, font_size=12)
+
+    # draw bboxes (operate on RGB arrays; color tuple values won't affect coords)
+    if bbox0 is not None:
+        b0 = bbox0.detach().cpu().numpy() if torch.is_tensor(bbox0) else np.array(bbox0)
+        b0 = b0.reshape(-1)[:4].astype(np.int32)
+        img0 = draw_bbox(img0, tuple(b0.tolist()))
+    if bbox1 is not None:
+        b1 = bbox1.detach().cpu().numpy() if torch.is_tensor(bbox1) else np.array(bbox1)
+        b1 = b1.reshape(-1)[:4].astype(np.int32)
+        img1 = draw_bbox(img1, tuple(b1.tolist()))
+
+    # prepare canvas (RGB)
+    H0, W0 = img0.shape[:2]
+    H1, W1 = img1.shape[:2]
+    H = max(H0, H1)
+    W = W0 + W1 + margin
+    canvas = 255 * np.ones((H, W, 3), dtype=np.uint8)
+    canvas[:H0, :W0] = img0
+    canvas[:H1, W0 + margin: W0 + margin + W1] = img1
+
+    draw_canvas = canvas
+
+    # draw keypoints if requested (draw on draw_canvas)
+    if show_keypoints and (kpts0 is not None and kpts1 is not None):
+        k0 = np.round(np.asarray(kpts0)).astype(int)
+        k1 = np.round(np.asarray(kpts1)).astype(int)
+        for x, y in k0:
+            cv2.circle(draw_canvas, (int(x), int(y)), 2, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+            cv2.circle(draw_canvas, (int(x), int(y)), 1, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        for x, y in k1:
+            cv2.circle(draw_canvas, (int(x), int(y)), 2, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+            cv2.circle(draw_canvas, (int(x), int(y)), 1, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+    # draw matches (mkpts0 and mkpts1 are Nx2) on draw_canvas
+    if mkpts0 is not None and mkpts1 is not None and len(mkpts0) > 0 and len(mkpts1) > 0:
+        mk0 = np.round(np.asarray(mkpts0)).astype(int)
+        mk1 = np.round(np.asarray(mkpts1)).astype(int)
+
+        # If postfilter info provided -> color by kept/filtered and modulate by weight
+        color_arr = None
+        if match_keep is not None:
+            mk_bool = np.asarray(match_keep).astype(bool)
+            if mk_bool.shape[0] != len(mk0):
+                mk_bool = mk_bool[:len(mk0)]
+            if match_weights is None:
+                weights = np.ones(len(mk0), dtype=np.float32)
+            else:
+                weights = np.asarray(match_weights, dtype=np.float32)
+                if weights.shape[0] != len(mk0):
+                    weights = np.ones(len(mk0), dtype=np.float32)
+            # create RGB color per match: kept -> green, filtered -> red; scale by weight
+            color_arr = np.zeros((len(mk0), 3), dtype=int)
+            green = np.array([0, 255, 0], dtype=float)   # RGB green
+            red = np.array([255, 0, 0], dtype=float)     # RGB red
+            for i in range(len(mk0)):
+                base = green if mk_bool[i] else red
+                w = float(np.clip(weights[i], 0.0, 1.0))
+                scale = 0.6 + 0.4 * w if mk_bool[i] else 0.25 + 0.75 * w
+                col = (base * scale).astype(int)
+                color_arr[i, :] = np.clip(col, 0, 255)
+        else:
+            # fallback to existing color semantics (assume input colors are RGB)
+            if color is None or len(color) == 0:
+                color_arr = np.tile(np.array([255, 255, 255]), (len(mk0), 1))  # white fallback (RGB)
+            else:
+                c = np.asarray(color)
+                if c.ndim == 1 and c.shape[0] == len(mk0):
+                    mask_bool = c.astype(bool)
+                    color_arr = np.zeros((len(mk0), 3), dtype=int)
+                    color_arr[mask_bool] = np.array([0, 255, 0], dtype=int)   # GREEN (RGB)
+                    color_arr[~mask_bool] = np.array([255, 0, 0], dtype=int)  # RED (RGB)
+                else:
+                    if c.dtype.kind == 'f' and c.max() <= 1.0:
+                        c = (c[:, :3] * 255).astype(int)
+                    else:
+                        c = c[:, :3].astype(int)
+                    # input assumed RGB -> keep as RGB
+                    color_arr = c[:, :3]
+
+        for (x0, y0), (x1, y1), col in zip(mk0, mk1, color_arr):
+            col_t = tuple(int(v) for v in col.tolist())
+            pt0 = (int(x0), int(y0))
+            pt1 = (int(x1 + margin + W0), int(y1))
+            cv2.line(draw_canvas, pt0, pt1, col_t, 1, lineType=cv2.LINE_AA)
+            cv2.circle(draw_canvas, pt0, 2, col_t, -1, lineType=cv2.LINE_AA)
+            cv2.circle(draw_canvas, pt1, 2, col_t, -1, lineType=cv2.LINE_AA)
+
+    # canvas already RGB (we drew in-place)
+    # add small_text legend if provided (compose as a short label)
+    # if small_text is not None:
+    #     legend = '\n'.join(small_text)
+    #     for i, line in enumerate(small_text):
+    #         y_offset = i * 14
+    #         canvas = draw_small_label(canvas, line, font_size=10, padding=4)
+
+    # save or display
+    if path is not None:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        cv2.imwrite(str(path), canvas[..., ::-1])
+
+    # Optional covisibility output on fixed 1024x1024 padded inputs.
+    if covisualize and path is not None:
+        raw0 = _to_hwc_uint8(image0)
+        raw1 = _to_hwc_uint8(image1)
+
+        # Resize each image by long side to 1024, then pad to 1024x1024 (bottom/right).
+        def _resize_pad_1024(img):
+            h, w = img.shape[:2]
+            if h == 0 or w == 0:
+                return np.zeros((1024, 1024, 3), dtype=np.uint8)
+            scale = 1024.0 / max(h, w)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            canvas_1024 = np.zeros((1024, 1024, 3), dtype=np.uint8)
+            canvas_1024[:new_h, :new_w] = img_resized
+            return canvas_1024
+
+        im0_1024 = _resize_pad_1024(raw0)
+        im1_1024 = _resize_pad_1024(raw1)
+
+        # Resize covisibility masks with nearest-neighbor to preserve hard boundaries.
+        def _resize_mask_nn(m, target_h=1024, target_w=1024):
+            if m is None:
+                return np.zeros((target_h, target_w), dtype=np.float32)
+            if torch.is_tensor(m):
+                m_np = m.detach().cpu().float().squeeze().numpy()
+            else:
+                m_np = np.array(m)
+            m_np = np.squeeze(m_np)
+            if m_np.ndim == 3:
+                m_np = m_np.squeeze(0)
+            if m_np.ndim != 2:
+                return np.zeros((target_h, target_w), dtype=np.float32)
+            if m_np.max() > 1.0:
+                m_np = m_np / 255.0
+            m_np = np.clip(m_np, 0.0, 1.0).astype(np.float32)
+
+            # --- NEW: if target is square-padded, preserve aspect and pad bottom/right (top-left content) ---
+            mh, mw = m_np.shape
+            if target_h == target_w and (mh != target_h or mw != target_w):
+                s = min(float(target_w) / float(mw), float(target_h) / float(mh))
+                new_w = max(1, int(round(mw * s)))
+                new_h = max(1, int(round(mh * s)))
+                m_rs = cv2.resize(m_np, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                out = np.zeros((target_h, target_w), dtype=np.float32)
+                out[:new_h, :new_w] = m_rs
+                return out
+
+            return cv2.resize(m_np, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+        m0_1024 = _resize_mask_nn(covis_mask0)
+        m1_1024 = _resize_mask_nn(covis_mask1)
+
+        # Apply semi-transparent magenta fill with opaque magenta contours.
+        def _apply_covis_with_contour(im, m, color=(255, 0, 255), alpha=0.35):
+            """Overlay covisibility region and contour on an RGB uint8 image."""
+            im_f = im.astype(np.float32)
+            out = im_f.copy()  # <-- FIX: define `out` before using it
+            m = np.clip(m, 0.0, 1.0)
+            # 二值 mask 用于区域 + 轮廓
+            bin_m = (m > 0.4).astype(np.uint8)
+            if bin_m.sum() == 0:
+                return im.copy()
+
+            # 半透明区域叠加
+            mask3 = np.repeat(bin_m[..., None], 3, axis=-1).astype(bool)
+            tint = np.zeros_like(im_f)
+            tint[..., 0] = color[0]
+            tint[..., 1] = color[1]
+            tint[..., 2] = color[2]
+            out[mask3] = ((1.0 - alpha) * out[mask3] + alpha * tint[mask3])
+
+            # 勾勒边缘（不透明洋红线条）
+            # 注意：cv2.findContours 要求单通道 uint8
+            contours, _hier = cv2.findContours(
+                bin_m,
+                cv2.RETR_CCOMP,  # Keep both outer and inner contours.
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(out, contours, -1, color, 2, lineType=cv2.LINE_AA)
+
+            return np.clip(out, 0, 255).astype(np.uint8)
+
+        im0_covis = _apply_covis_with_contour(im0_1024, m0_1024)
+        im1_covis = _apply_covis_with_contour(im1_1024, m1_1024)
+
+        # 5. 水平拼接成 1024x2048
+        cov_canvas = np.zeros((1024, 2048, 3), dtype=np.uint8)
+        cov_canvas[:1024, :1024] = im0_covis
+        cov_canvas[:1024, 1024:2048] = im1_covis
+
+        # 6. 保存共视图（BGR）
+        root, ext = os.path.splitext(path)
+        cov_path = root + covis_path_suffix + ext
+        cv2.imwrite(str(cov_path), cov_canvas[..., ::-1])
+
+    if opencv_display:
+        cv2.imshow(opencv_title, canvas[..., ::-1])
+        cv2.waitKey(1)
+    return canvas
+
+
+# def plot_image_pair(images, titles=None, figsize=(12, 6), cmap=None):
+#     """Plot list of HWC images side-by-side on current matplotlib figure.
+#     Kept minimal: does not save/close the figure (callers use plt.savefig / plt.close)."""
+#     n = len(images)
+#     plt.figure(figsize=figsize)
+#     for i, img in enumerate(images):
+#         ax = plt.subplot(1, n, i + 1)
+#         im = _to_hwc_uint8(img)
+#         # handle grayscale display
+#         if im.ndim == 2 or (im.ndim == 3 and im.shape[2] == 1):
+#             if isinstance(cmap, (list, tuple)):
+#                 cmap_i = cmap[i] if i < len(cmap) else None
+#             else:
+#                 cmap_i = cmap
+#             ax.imshow(im[..., 0] if im.ndim == 3 else im, cmap=cmap_i)
+#         else:
+#             ax.imshow(im)
+#         ax.axis('off')
+#         if titles and i < len(titles):
+#             ax.set_title(titles[i])
+#     plt.tight_layout()
+    
 def plot_image_pair(imgs, dpi=100, size=20, pad=0.5):
-    """Plot a pair of images side by side."""
     n = len(imgs)
     assert n == 2, 'number of images must be two'
     figsize = (size * n, size * 3 / 4) if size is not None else None
-    _, ax = plt.subplots(n, 1, figsize=figsize, dpi=dpi)
+    _, ax = plt.subplots(1, n, figsize=figsize, dpi=dpi)
     for i in range(n):
-        ax[i].imshow(imgs[i].astype('uint8'),
-                     cmap=plt.get_cmap('gray'),
-                     vmin=0,
-                     vmax=255)
+        ax[i].imshow(
+            imgs[i].astype('uint8'),
+            cmap=plt.get_cmap('gray'),
+            vmin=0,
+            vmax=255,
+        )
         ax[i].get_yaxis().set_ticks([])
         ax[i].get_xaxis().set_ticks([])
-        for spine in ax[i].spines.values():  # remove frame
+        for spine in ax[i].spines.values():
             spine.set_visible(False)
     plt.tight_layout(pad=pad)
 
 
-def plot_keypoints(kpts0, kpts1, color='w', ps=2):
-    """Plot keypoints on both images."""
-    ax = plt.gcf().axes
-    ax[0].scatter(kpts0[:, 0], kpts0[:, 1], c=color, s=ps)
-    ax[1].scatter(kpts1[:, 0], kpts1[:, 1], c=color, s=ps)
-
-
-def plot_matches(kpts0, kpts1, color, lw=1.5, ps=4):
-    """Plot matching lines between keypoints."""
-    fig = plt.gcf()
-    ax = fig.axes
-    fig.canvas.draw()
-
-    transFigure = fig.transFigure.inverted()
-    fkpts0 = transFigure.transform(ax[0].transData.transform(kpts0))
-    fkpts1 = transFigure.transform(ax[1].transData.transform(kpts1))
-
-    fig.lines = [
-        matplotlib.lines.Line2D(
-            (fkpts0[i, 0], fkpts1[i, 0]),
-            (fkpts0[i, 1], fkpts1[i, 1]),
-            zorder=1,
-            transform=fig.transFigure,
-            c=color[i],
-            linewidth=lw,
-        ) for i in range(len(kpts0))
-    ]
-    ax[0].scatter(kpts0[:, 0], kpts0[:, 1], c=color, s=ps)
-    ax[1].scatter(kpts1[:, 0], kpts1[:, 1], c=color, s=ps)
-
-
-def make_matching_plot(
-        image0,
-        image1,
-        kpts0,
-        kpts1,
-        mkpts0,
-        mkpts1,
-        color,
-        text,
-        path,
-        bbox0,
-        bbox1,
-        mask0, 
-        mask1,
-        show_keypoints=False,
-        fast_viz=False,
-        opencv_display=False,
-        opencv_title='matches',
-        small_text=None,
+def vis_aligned_image(
+    ref_image,
+    src_image,
+    H=None,
+    bbox_ref=None,
+    bbox_src=None,
+    output=None,
+    alpha=0.5,
+    border_value=(0, 0, 0),
 ):
-    """Create a comprehensive matching visualization plot."""
-    if fast_viz:
-        make_matching_plot_fast(
-            image0,
-            image1,
-            kpts0,
-            kpts1,
-            mkpts0,
-            mkpts1,
-            color,
-            text,
-            path,
-            show_keypoints,
-            400,
-            opencv_display,
-            opencv_title,
-            small_text,
-        )
-        return
-    
-    # Apply mask overlay if provided
-    if mask0 is not None:
-        image0 = apply_mask_overlay(image0, mask0, alpha=0.3, mask_color=(0, 255, 0))
-        image1 = apply_mask_overlay(image1, mask1, alpha=0.3, mask_color=(0, 255, 0))
+    """
+    Visualize src_image aligned to ref_image by homography H (src -> ref).
+    If H is None or invalid, return a side-by-side canvas.
+    """
+    im_ref = _to_hwc_uint8(ref_image)
+    im_src = _to_hwc_uint8(src_image)
+    if im_ref is None or im_src is None:
+        return None
 
-    # Draw bounding boxes if provided
-    if bbox0 is not None:
-        bbox0 = tuple(bbox0.astype(np.int8))
-        bbox1 = tuple(bbox1.astype(np.int8))
-        image0 = draw_bbox(image0, bbox0, tag=False)
-        image1 = draw_bbox(image1, bbox1, tag=False)
+    h_ref, w_ref = im_ref.shape[:2]
+    h_src, w_src = im_src.shape[:2]
 
-    plot_image_pair([image0, image1])
-    if show_keypoints:
-        plot_keypoints(kpts0, kpts1, color='k', ps=4)
-        plot_keypoints(kpts0, kpts1, color='w', ps=2)
-    plot_matches(mkpts0, mkpts1, color)
+    def _draw_xyxy(img, box, color, offset_x=0):
+        if box is None:
+            return
+        b = np.asarray(box).reshape(-1)
+        if b.size < 4:
+            return
+        x0, y0, x1, y1 = [int(round(float(v))) for v in b[:4]]
+        cv2.rectangle(img, (x0 + offset_x, y0), (x1 + offset_x, y1), color, 2)
 
-    plt.savefig(str(path), bbox_inches='tight', pad_inches=0)
-    plt.close()
+    if H is None:
+        margin = 20
+        Hc = max(h_ref, h_src)
+        Wc = w_ref + w_src + margin
+        canvas = 255 * np.ones((Hc, Wc, 3), dtype=np.uint8)
+        canvas[:h_ref, :w_ref] = im_ref
+        canvas[:h_src, w_ref + margin:w_ref + margin + w_src] = im_src
 
+        _draw_xyxy(canvas, bbox_ref, (255, 0, 0), offset_x=0)
+        _draw_xyxy(canvas, bbox_src, (0, 255, 0), offset_x=w_ref + margin)
 
-def make_matching_plot_fast(
-        image0,
-        image1,
-        kpts0,
-        kpts1,
-        mkpts0,
-        mkpts1,
-        color,
-        text,
-        path=None,
-        show_keypoints=False,
-        margin=100,
-        opencv_display=False,
-        opencv_title='',
-        small_text=None,
-):
-    """Create a fast matching visualization using OpenCV."""
-    # Convert to grayscale if needed
-    if len(image0.shape) == 3:
-        image0 = cv2.cvtColor(image0, cv2.COLOR_BGR2GRAY)
-    if len(image1.shape) == 3:
-        image1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY)
+        if output is not None:
+            os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
+            cv2.imwrite(str(output), canvas[..., ::-1])
+        return canvas
 
-    H0, W0 = image0.shape[0], image0.shape[1]
-    H1, W1 = image1.shape[0], image1.shape[1]
-    H, W = max(H0, H1), W0 + W1 + margin
-    
-    # Create output canvas
-    out = 255 * np.ones((H, W), np.uint8)
-    out[:H0, :W0] = image0
-    out[:H1, W0 + margin:] = image1
-    out = np.stack([out] * 3, -1)
+    H_np = np.asarray(H, dtype=np.float64)
+    if H_np.shape != (3, 3) or not np.isfinite(H_np).all():
+        return vis_aligned_image(ref_image, src_image, H=None, bbox_ref=bbox_ref, bbox_src=bbox_src, output=output)
 
-    # Draw keypoints if requested
-    if show_keypoints:
-        kpts0, kpts1 = np.round(kpts0).astype(int), np.round(kpts1).astype(int)
-        white = (255, 255, 255)
-        black = (0, 0, 0)
-        for x, y in kpts0:
-            cv2.circle(out, (x, y), 2, black, -1, lineType=cv2.LINE_AA)
-            cv2.circle(out, (x, y), 1, white, -1, lineType=cv2.LINE_AA)
-        for x, y in kpts1:
-            cv2.circle(out, (x + margin + W0, y),
-                       2,
-                       black,
-                       -1,
-                       lineType=cv2.LINE_AA)
-            cv2.circle(out, (x + margin + W0, y),
-                       1,
-                       white,
-                       -1,
-                       lineType=cv2.LINE_AA)
+    warped = cv2.warpPerspective(
+        im_src,
+        H_np,
+        (w_ref, h_ref),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=border_value,
+    )
 
-    # Draw matches
-    mkpts0, mkpts1 = np.round(mkpts0).astype(int), np.round(mkpts1).astype(int)
-    color = (np.array(color[:, :3]) * 255).astype(int)[:, ::-1]
-    for (x0, y0), (x1, y1), c in zip(mkpts0, mkpts1, color):
-        c = c.tolist()
-        cv2.line(
-            out,
-            (x0, y0),
-            (x1 + margin + W0, y1),
-            color=c,
-            thickness=1,
-            lineType=cv2.LINE_AA,
-        )
-        # Draw line end-points as circles
-        cv2.circle(out, (x0, y0), 2, c, -1, lineType=cv2.LINE_AA)
-        cv2.circle(out, (x1 + margin + W0, y1), 2, c, -1, lineType=cv2.LINE_AA)
+    gray_warp = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+    mask = (gray_warp > 0).astype(np.float32)[..., None]
 
-    # Scale factor for consistent visualization across scales
-    sc = min(H / 640.0, 2.0)
+    ref_f = im_ref.astype(np.float32) / 255.0
+    warped_f = warped.astype(np.float32) / 255.0
+    alpha_arr = alpha * mask
+    out_f = ref_f * (1.0 - alpha_arr) + warped_f * alpha_arr
+    out = np.clip(out_f * 255.0, 0, 255).astype(np.uint8)
 
-    # Add main text
-    Ht = int(30 * sc)  # text height
-    txt_color_fg = (255, 255, 255)
-    txt_color_bg = (0, 0, 0)
-    for i, t in enumerate(text):
-        cv2.putText(
-            out,
-            t,
-            (int(8 * sc), Ht * (i + 1)),
-            cv2.FONT_HERSHEY_DUPLEX,
-            1.0 * sc,
-            txt_color_bg,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            out,
-            t,
-            (int(8 * sc), Ht * (i + 1)),
-            cv2.FONT_HERSHEY_DUPLEX,
-            1.0 * sc,
-            txt_color_fg,
-            1,
-            cv2.LINE_AA,
-        )
+    _draw_xyxy(out, bbox_ref, (255, 0, 0), offset_x=0)
 
-    # Add small text at bottom
-    if small_text is None:
-        small_text = []
-    Ht = int(18 * sc)  # text height
-    for i, t in enumerate(reversed(small_text)):
-        cv2.putText(
-            out,
-            t,
-            (int(8 * sc), int(H - Ht * (i + 0.6))),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.5 * sc,
-            txt_color_bg,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            out,
-            t,
-            (int(8 * sc), int(H - Ht * (i + 0.6))),
-            cv2.FONT_HERSHEY_DUPLEX,
-            0.5 * sc,
-            txt_color_fg,
-            1,
-            cv2.LINE_AA,
-        )
-    
-    if path is not None:
-        cv2.imwrite(str(path), out)
+    if bbox_src is not None:
+        b = np.asarray(bbox_src).reshape(-1)
+        if b.size >= 4:
+            xs = np.array([[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]], dtype=np.float64)
+            ones = np.ones((4, 1), dtype=np.float64)
+            pts = np.hstack([xs, ones])
+            pts_t = (H_np @ pts.T).T
+            valid = np.abs(pts_t[:, 2]) > 1e-12
+            if valid.all():
+                pts_xy = pts_t[:, :2] / pts_t[:, 2:3]
+                pts_int = np.round(pts_xy).astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(out, [pts_int], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    if opencv_display:
-        cv2.imshow(opencv_title, out)
-        cv2.waitKey(1)
-
+    if output is not None:
+        os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
+        cv2.imwrite(str(output), out[..., ::-1])
     return out
 
 
-def stack_image_pair(image0, image1):
-    """Stack two images with different color channels for comparison."""
-    image0 = np.copy(image0)
-    image1 = np.copy(image1)
+def ensure_prediction_fields(pred, data=None, device=None):
+    """
+    Ensure all required prediction fields exist with default values.
     
-    # Convert to 3-channel if needed
-    if len(image0.shape) == 2:
-        image0 = np.tile(np.expand_dims(image0, 2), [1, 1, 3])
-    if len(image1.shape) == 2:
-        image1 = np.tile(np.expand_dims(image1, 2), [1, 1, 3])
+    Args:
+        pred (dict): Prediction dictionary
+        data (dict, optional): Input data dictionary to get image dimensions
+        device (torch.device, optional): Device to place tensors on
     
-    # Change color channels for better comparison
-    image0.setflags(write=1)
-    image1.setflags(write=1)
-    image0[:, :, 1:] = 0  # Keep only red channel
-    image1[:, :, :2] = 0  # Keep only blue channel
-    stack_img = cv2.addWeighted(image0, 0.5, image1, 0.5, 0)
-    return stack_img
-
-
-def vis_aligned_image(image0, image1, H, path=None):
-    """Visualize image alignment before and after transformation."""
-    warpped_image1 = cv2.warpPerspective(image1, H,
-                                         (image0.shape[1], image0.shape[0]))
-
-    before = stack_image_pair(image0, image1)
-    after = stack_image_pair(image0, warpped_image1)
-    align_img = np.concatenate(
-        [
-            cv2.resize(before, dsize=None, fx=0.5, fy=0.5),
-            cv2.resize(after, dsize=None, fx=0.5, fy=0.5),
-        ],
-        axis=1,
-    )
-    if path is not None:
-        cv2.imwrite(str(path), align_img)
-
-
-def error_colormap(x):
-    """Generate error colormap for visualization."""
-    return np.clip(
-        np.stack([2 - x * 2, x * 2,
-                  np.zeros_like(x),
-                  np.ones_like(x)], -1), 0, 1)
-
-
-def get_foreground_mask(img_data, **kwargs):
-    """Extract foreground mask using adaptive methods."""
-    sys.path.append(
-        os.path.join(os.path.dirname(__file__),
-                     '../../models/ImagePreprocess'))
-    from adaptive_foreground_extractor import AdaptiveForegroundExtractor
-
-    fg_extractor = AdaptiveForegroundExtractor()
-    if kwargs['method_type'] == 'method1':
-        mask_data = fg_extractor.method1(
-            img_data,
-            min_area_close=kwargs['min_area_close'],
-            close_ratio=kwargs['close_ratio'],
-            remain_connect_regions_num=kwargs['remain_connect_regions_num'],
-            min_area_deleting=kwargs['min_area_deleting'],
-            connectivity=kwargs['connectivity'],
-        )
-
-    if kwargs['method_type'] == 'method2':
-        mask_data = fg_extractor.method2(
-            img_data,
-            close_ratio=kwargs['close_ratio'],
-            min_area_close=kwargs['min_area_close'],
-            remain_connect_regions_num=kwargs['remain_connect_regions_num'],
-            min_area_deleting=kwargs['min_area_deleting'],
-            connectivity=kwargs['connectivity'],
-            flood_fill_seed_point=kwargs['flood_fill_seed_point'],
-            flood_fill_low_diff=kwargs['flood_fill_low_diff'],
-            flood_fill_up_diff=kwargs['flood_fill_up_diff'],
-        )
-
-    return mask_data
-
-
-def pad_mask(mask, bbox=None, outer_factor=50, inner_factor=60, threshold=-0.5):
-    """Pad mask using morphological operations."""
-    if bbox is None:
-        n, c, h, w = mask.shape
-        bbox = torch.tensor([[0, 0, h, w]]).int()
+    Returns:
+        dict: Updated prediction dictionary with all required fields
+    """
+    if device is None:
+        if data is not None:
+            if 'image0' in data:
+                device = data['image0'].device
+            elif 'overlap_image0' in data:
+                device = data['overlap_image0'].device
+            else:
+                device = torch.device('cpu')
+        else:
+            # Try to infer device from existing tensors in pred
+            for v in pred.values():
+                if isinstance(v, torch.Tensor):
+                    device = v.device
+                    break
+            else:
+                device = torch.device('cpu')
     
-    outer_kernel = np.ones(
-        ((bbox[0, 2] - bbox[0, 0]).int() // outer_factor, (bbox[0, 3] - bbox[0, 1]).int() // outer_factor), np.uint8
-    )
-    
-    mask_arr = mask.cpu().squeeze().numpy().astype(np.uint8)
-    mask_outer = cv2.dilate(mask_arr, outer_kernel, iterations=2)
-    mask_outer = torch.tensor(mask_outer, device=mask.device).unsqueeze(0).unsqueeze(1)
-
-    return mask_outer
-
-
-def draw_bbox(img, box, score=None, gt_box=None, tag=True, background=True):
-    """Draw bounding box on image with optional score and ground truth."""
-    img_b = img.copy()
-    
-    # Create background mask
-    img_b[:box[1], :, :] = 255
-    img_b[box[3]:, :, :] = 255
-    img_b[:, :box[0], :] = 255
-    img_b[:, box[2]:, :] = 255
-
-    # Add text backgrounds if tagging is enabled
-    if tag:
-        if gt_box is not None:
-            cv2.rectangle(img_b, (gt_box[2] - 215, gt_box[3] - 36), gt_box[2:], (71, 99, 255), -1)
-        cv2.rectangle(img_b, box[:2], (box[0] + 290, box[1] + 37), (255, 144, 30), -1)
-
-    # Blend background if enabled
-    if background:
-        img = cv2.addWeighted(img, 0.4, img_b, 0.6, 0)
-
-    # Draw ground truth box
-    if gt_box is not None:
-        cv2.rectangle(img, gt_box[:2], gt_box[2:], (71, 99, 255), 2)
-        if tag:
-            cv2.putText(
-                img=img,
-                text='Ground Truth',
-                org=(gt_box[2] - 210, gt_box[3] - 8),
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=1,
-                color=(255, 255, 255),
-                thickness=2,
-                lineType=cv2.LINE_AA)
-
-    # Draw predicted box
-    cv2.rectangle(img, box[:2], box[2:], (30, 144, 255), 2)
-    if tag:
-        text = 'Our DetMatcher' if score is None else 'Confidence:{:.3f}'.format(float(score))
-        cv2.putText(
-            img=img,
-            text=text,
-            org=(box[0] + 5, box[1] + 30),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=1,
-            color=(255, 255, 255),
-            thickness=2,
-            lineType=cv2.LINE_AA)
-
-    return img
-
-
-def apply_mask_overlay(image, mask, alpha=0.3, mask_color=(0, 0, 255)):
-    """Apply mask overlay on image with specified transparency and color."""
-    if mask is None:
-        return image
-    
-    # Ensure image is 3-channel
-    if len(image.shape) == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-    elif len(image.shape) == 3 and image.shape[2] == 1:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-    
-    # Process mask format
-    if torch.is_tensor(mask):
-        mask_np = mask.cpu().numpy()
+    # Get image dimensions for bbox defaults
+    if data is not None and 'image0' in data:
+        h0, w0 = data['image0'].shape[2], data['image0'].shape[3]
+        h1, w1 = data['image1'].shape[2], data['image1'].shape[3]
     else:
-        mask_np = mask
+        # Use sensible defaults if no data available
+        h0, w0, h1, w1 = 480, 640, 480, 640
     
-    # Ensure mask is 2D
-    if len(mask_np.shape) > 2:
-        mask_np = mask_np.squeeze()
+    # Ensure bbox0 exists
+    if 'bbox0' not in pred:
+        pred['bbox0'] = torch.tensor([[0.0, 0.0, w0, h0]], device=device)
     
-    # Scale mask to 0-1 range
-    if mask_np.max() > 1:
-        mask_np = mask_np.astype(np.float32) / 255.0
+    # Ensure bbox1 exists
+    if 'bbox1' not in pred:
+        pred['bbox1'] = torch.tensor([[0.0, 0.0, w1, h1]], device=device)
     
-    # Resize mask to match image
-    if mask_np.shape != image.shape[:2]:
-        mask_np = cv2.resize(mask_np, (image.shape[1], image.shape[0]))
+    # Ensure ratio0 exists
+    if 'ratio0' not in pred:
+        pred['ratio0'] = torch.tensor([[1.0, 1.0]], device=device)
     
-    # Create colored mask
-    mask_colored = np.zeros_like(image, dtype=np.float32)
-    mask_colored[:, :, 0] = mask_color[0] / 255.0  # R
-    mask_colored[:, :, 1] = mask_color[1] / 255.0  # G  
-    mask_colored[:, :, 2] = mask_color[2] / 255.0  # B
+    # Ensure ratio1 exists
+    if 'ratio1' not in pred:
+        pred['ratio1'] = torch.tensor([[1.0, 1.0]], device=device)
     
-    # Apply mask to each color channel
-    for i in range(3):
-        mask_colored[:, :, i] = mask_colored[:, :, i] * mask_np
+    # Ensure overlap_time exists
+    if 'overlap_time' not in pred:
+        pred['overlap_time'] = torch.tensor([0.0], device=device)
     
-    # Normalize image
-    image_normalized = image.astype(np.float32)
-    if image_normalized.max() > 1:
-        image_normalized = image_normalized / 255.0
-    
-    # Apply alpha blending
-    result = (1 - alpha) * image_normalized + alpha * mask_colored
-    
-    # Convert back to uint8
-    result = (result * 255).astype(np.uint8)
-    
-    return result
+    return pred
+
+def visualize_box_mask_constraint_pair(
+        image0,
+        image1,
+        bbox0,
+        bbox1,
+        mask0,
+        mask1,
+        output_path,
+        thresh=0.5,
+        margin=24,
+        alpha_green=0.40,
+):
+    """
+    Visualize mask+bbox with a style consistent with `viz` mode:
+      1) keep magenta mask visualization,
+      2) keep original brightness outside mask,
+      3) highlight constrained mask inside bbox in green with contour.
+    """
+    def _to_mask_hw(mask, h, w):
+        if mask is None:
+            return None
+        if torch.is_tensor(mask):
+            m = mask.detach().cpu().float().squeeze().numpy()
+        else:
+            m = np.asarray(mask).squeeze().astype(np.float32)
+        if m.ndim != 2:
+            return None
+        if m.max() > 1.0:
+            m = m / 255.0
+        m = np.clip(m, 0.0, 1.0)
+        if m.shape != (h, w):
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        return m
+
+    def _to_box_xyxy(box, h, w):
+        if box is None:
+            return None
+        if torch.is_tensor(box):
+            b = box.detach().cpu().numpy().reshape(-1)[:4]
+        else:
+            b = np.asarray(box).reshape(-1)[:4]
+        x0, y0, x1, y1 = [int(round(float(v))) for v in b]
+        x0 = max(0, min(w - 1, x0)); x1 = max(0, min(w, x1))
+        y0 = max(0, min(h - 1, y0)); y1 = max(0, min(h, y1))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    def _render_one(img_in, mask_in, box_in):
+        img = _to_hwc_uint8(img_in)
+        h, w = img.shape[:2]
+        m = _to_mask_hw(mask_in, h, w)
+        box = _to_box_xyxy(box_in, h, w)
+
+        out_u8 = img.copy()
+
+        # 1) Global mask: magenta overlay (do NOT darken non-mask area)
+        if m is not None:
+            m_soft = np.clip(m, 0.0, 1.0).astype(np.float32)
+            alpha_magenta = 0.35
+            out_f = out_u8.astype(np.float32) / 255.0
+            magenta = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+            a = (alpha_magenta * m_soft)[..., None]
+            out_f = (1.0 - a) * out_f + a * magenta
+            out_u8 = np.clip(out_f * 255.0, 0, 255).astype(np.uint8)
+
+            # magenta contour
+            m_bin = (m_soft > float(thresh)).astype(np.uint8)
+            if m_bin.sum() > 0:
+                contours, _ = cv2.findContours(m_bin, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(out_u8, contours, -1, (255, 0, 255), 2, lineType=cv2.LINE_AA)
+
+        # 2) BBox style: keep existing bbox style
+        if box is not None:
+            out_u8 = draw_bbox(out_u8, box)
+
+        # 3) Green constrained-mask inside bbox + green contour
+        if m is not None and box is not None:
+            x0, y0, x1, y1 = box
+            roi_bin = (m[y0:y1, x0:x1] > float(thresh)).astype(np.uint8)
+            if roi_bin.size > 0 and roi_bin.sum() > 0:
+                out_f = out_u8.astype(np.float32) / 255.0
+                sub = out_f[y0:y1, x0:x1]
+                green = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                sub = (1.0 - alpha_green * roi_bin[..., None]) * sub + (alpha_green * roi_bin[..., None]) * green
+                out_f[y0:y1, x0:x1] = sub
+                out_u8 = np.clip(out_f * 255.0, 0, 255).astype(np.uint8)
+
+                contours, _ = cv2.findContours(roi_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for c in contours:
+                    c_shift = c + np.array([[[x0, y0]]], dtype=c.dtype)
+                    cv2.drawContours(out_u8, [c_shift], -1, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+
+        return out_u8
+
+    vis0 = _render_one(image0, mask0, bbox0)
+    vis1 = _render_one(image1, mask1, bbox1)
+
+    h = max(vis0.shape[0], vis1.shape[0])
+    w = vis0.shape[1] + vis1.shape[1] + margin
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    canvas[:vis0.shape[0], :vis0.shape[1]] = vis0
+    canvas[:vis1.shape[0], vis0.shape[1] + margin:vis0.shape[1] + margin + vis1.shape[1]] = vis1
+
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    cv2.imwrite(str(output_path), canvas[..., ::-1])
+    return canvas

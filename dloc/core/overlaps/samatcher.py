@@ -7,7 +7,7 @@ from src.build_samatcher import build_samatcher
 
 class SAMatcher(BaseModel):
     default_conf = {
-        'weights': 'samatcher.ckpt',
+        'weights': 'samatcher_best.ckpt',
         'sam_cfg': 'configs/sam2.1/sam2.1_hiera_l_sammatcher.yaml',
         'sam_checkpoint': 'checkpoints/sam2.1_hq_hiera_large.pt',
     }
@@ -41,10 +41,10 @@ class SAMatcher(BaseModel):
         
         masks, boxes = self.model.forward(data['image0'].permute(0, 3, 1, 2), data['image1'].permute(0, 3, 1, 2))
         bbox0, bbox1 = boxes
-        mask0, mask1 = masks[0, 0], masks[0, 1]
+        mask0_o, mask1_o = masks[0, 0], masks[0, 1]
         
         # Reshape masks to original image size
-        mask0 = F.interpolate(mask0.unsqueeze(0).unsqueeze(0), size=(h0, w0), mode='bilinear', align_corners=False).squeeze()
-        mask1 = F.interpolate(mask1.unsqueeze(0).unsqueeze(0), size=(h1, w1), mode='bilinear', align_corners=False).squeeze()
+        mask0 = F.interpolate(mask0_o.unsqueeze(0).unsqueeze(0), size=(h0, w0), mode='bilinear', align_corners=False).squeeze()
+        mask1 = F.interpolate(mask1_o.unsqueeze(0).unsqueeze(0), size=(h1, w1), mode='bilinear', align_corners=False).squeeze()
         
-        return bbox0, bbox1, mask0, mask1
+        return bbox0, bbox1, mask0, mask1, mask0_o.unsqueeze(0).unsqueeze(0), mask1_o.unsqueeze(0).unsqueeze(0)
