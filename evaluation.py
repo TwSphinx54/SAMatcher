@@ -13,15 +13,16 @@ from dloc.api import extract_process
 from dloc.core.utils.base_model import dynamic_load
 from dloc.core.match_features import preprocess_match_pipeline
 from dloc.core.overlap_features import preprocess_overlap_pipeline
-from dloc.core.utils.utils import make_matching_plot, tensor_overlap_crop, vis_aligned_image, visualize_box_mask_constraint_pair
+from dloc.core.utils.utils import make_matching_plot, tensor_overlap_crop, visualize_box_mask_constraint_pair
 from dloc.core import extract_features, extractors, match_features, matchers, overlap_features, overlaps
 
 torch.set_grad_enabled(False)
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 t_thres=0.3
+VIZ_GRID_WIN = 16
 
-# --- New: gridify binary masks for visualization (does NOT affect matching) ---
+
 def _gridify_bin_mask(mask, win: int = 16, thresh: float = 0.5):
     """
     Gridify a (binary-ish) mask by NxN windows:
@@ -73,7 +74,6 @@ def _gridify_bin_mask(mask, win: int = 16, thresh: float = 0.5):
     up = np.repeat(np.repeat(pooled, win, axis=0), win, axis=1)
     return up[:H, :W].astype(np.float32)
 
-# --- New: make sure viz has bin/crop masks even if pipeline didn't return them ---
 def _ensure_viz_masks(results, bin_thresh=0.5, extractor_name=''):
     # mask*_bin: if missing, derive from mask* (soft) for visualization purposes
     if results.get('mask0_bin', None) is None and results.get('mask0', None) is not None:
@@ -139,7 +139,6 @@ class Matching(torch.nn.Module):
         self.matcher_name = self.config['matcher']['model']['name']
         self.size_divisor = 1
 
-    # --- New helper: ensure consistent default fields in pred ---
     def _ensure_pred_defaults(self, pred, data):
         """
         Ensure pred dict contains bbox0/bbox1, ratio0/ratio1, mask0/mask1,
@@ -214,7 +213,6 @@ class Matching(torch.nn.Module):
             # best-effort: do not crash the pipeline on helper errors
             pass
 
-    # --- New: pad-to-divisor helper for feature inputs (right/bottom zero padding) ---
     def _pad_to_divisor(self, img: torch.Tensor, divisor: int) -> torch.Tensor:
         if not isinstance(img, torch.Tensor):
             return img
@@ -324,7 +322,7 @@ class Matching(torch.nn.Module):
             mask0_o = mask0_o.sigmoid()
             mask1_o = mask1_o.sigmoid()
 
-            # --- Fix: compute soft-box directly from soft_mask (global), no base bbox offset ---
+            # Compute soft-box directly from global soft mask.
             def _bbox_from_soft_mask_global(soft_mask_t, th=0.05):
                 # soft_mask_t: tensor [1,1,H,W] or [H,W] at original image resolution
                 if soft_mask_t is None:
@@ -388,8 +386,6 @@ class Matching(torch.nn.Module):
             except Exception:
                 # Safe fallback: keep original bbox on error
                 pass
-            # --- end fix ---
-
             # Calculate overlap region dimensions
             # (convert to Python ints to avoid ambiguous tensor comparisons)
             bw0, bh0 = (
@@ -401,7 +397,7 @@ class Matching(torch.nn.Module):
                 int((bbox1[0][3] - bbox1[0][1]).item()),
             )
 
-            # --- New: fallback to full-image when mask or bbox are empty/too small ---
+            # Fallback to full-image when mask or bbox are empty/too small.
             def _mask_or_box_bad(bbox_t, soft_mask_t, min_side=8, min_mask_sum=1e-3):
                 try:
                     bw = float((bbox_t[0][2] - bbox_t[0][0]).item())
@@ -443,7 +439,7 @@ class Matching(torch.nn.Module):
                      and overlap_scores > 2.0)
                     or data['dataset_name'] != 'pragueparks-val'):
                 
-                # --- Changed: choose size_divisor satisfying matcher/extractor requirements ---
+                # Choose size_divisor satisfying matcher/extractor requirements.
                 size_div = 1
                 if self.matcher_name == 'loftr':
                     size_div = 8
@@ -498,7 +494,7 @@ class Matching(torch.nn.Module):
                 if 'keypoints0' not in data:
                     pred0 = self.extractor({'image': overlap0})
                     if self.config['overlaper']['model']['name'] == 'samatcher':
-                        # --- New: vectorized & soft prefilter (optional, low-thresh) ---
+                        # Soft prefilter in overlap mask.
                         pre_th = t_thres  # low threshold for prefilter (or set to 0.0 to disable)
                         dilate_r = 3   # small tolerance radius
                         m0 = crop_mask0.float().squeeze()  # [H,W], values in {0,1} or [0,1]
@@ -515,7 +511,7 @@ class Matching(torch.nn.Module):
                                 y0, y1 = max(0, y - dilate_r), min(H0, y + dilate_r + 1)
                                 valid0.append(float(m0[y0:y1, x0:x1].max()) >= pre_th)
                         valid0 = torch.tensor(valid0, device=k0.device, dtype=torch.bool)
-                        # --- New: record soft-prefilter stats for debug viz ---
+                        # Record prefilter stats for debugging/visualization.
                         n_raw0 = int(k0.shape[0])
                         n_keep0 = int(valid0.sum().item())
                         pred0['prefilter_raw'] = [torch.tensor(n_raw0, device=k0.device)]
@@ -584,7 +580,7 @@ class Matching(torch.nn.Module):
                     pred.update(matches)
                     return pred
                 
-                # --- Changed: pad full-image inputs for DISK extractor to multiples of 16 ---
+                # Pad full-image inputs for DISK extractor to multiples of 16.
                 if 'keypoints0' not in data:
                     img0_feat = data['image0']
                     if 'disk' in (self.extractor_name or ''):
@@ -643,7 +639,7 @@ class Matching(torch.nn.Module):
         matches = self.matcher(data)
         pred.update(matches)
 
-        # --- New: propagate prefilter flag for mask_filter auto-mode ---
+        # Propagate prefilter flag for mask_filter auto-mode.
         try:
             pref0 = pred.get('mask_prefiltered0', None)
             pref1 = pred.get('mask_prefiltered1', None)
@@ -752,7 +748,6 @@ def viz_pairs(output, image0, image1, name0, name1, mconf, kpts0, kpts1,
         print(f"viz_pairs: plotting failed for {name0}, {name1}: {e}")
         return
 
-# --- New: Debug visualization helpers ---
 def _local_max(mask, x, y, r=1):
     """Local max around integer (x,y) within radius r."""
     h, w = mask.shape
@@ -766,6 +761,48 @@ def _local_max(mask, x, y, r=1):
     return float(mask[y0:y1, x0:x1].max())
 
 
+def _to_numpy_mask(mask):
+    """Convert mask-like input to a 2D float32 numpy mask in [0, 1]."""
+    if mask is None:
+        return None
+    if isinstance(mask, torch.Tensor):
+        m = mask.detach().cpu().float().numpy()
+    else:
+        m = np.asarray(mask)
+
+    if m.size == 0:
+        return None
+
+    m = np.squeeze(m)
+    if m.ndim != 2:
+        return None
+
+    m = m.astype(np.float32)
+    if np.nanmax(m) > 1.0:
+        m = m / 255.0
+    m = np.nan_to_num(m, nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(m, 0.0, 1.0)
+
+
+def _get_mask_source(results, bin_key, soft_key):
+    """Fetch mask source by preferring binary mask then soft mask."""
+    if bin_key in results and results.get(bin_key) is not None:
+        return results.get(bin_key)
+    if soft_key in results and results.get(soft_key) is not None:
+        return results.get(soft_key)
+    return None
+
+
+def _gridified_numpy_mask(mask_like, thresh: float, win: int = VIZ_GRID_WIN):
+    """Gridify mask and return a 2D float numpy mask in [0, 1]."""
+    return _to_numpy_mask(_gridify_bin_mask(mask_like, win=win, thresh=thresh))
+
+
+def _gridified_mask(mask_like, thresh: float, win: int = VIZ_GRID_WIN):
+    """Gridify mask and keep original backend type (torch or numpy)."""
+    return _gridify_bin_mask(mask_like, win=win, thresh=thresh)
+
+
 def mask_filter_and_reweight(results, thresh=0.5, dilate=1, grid_win: int = 16):
     """
     Filter matches using predicted masks at original image scale.
@@ -776,23 +813,11 @@ def mask_filter_and_reweight(results, thresh=0.5, dilate=1, grid_win: int = 16):
     if 'mask1' not in results and 'mask1_bin' not in results:
         return results
 
-    # Use a gridified binary mask for filtering — but do NOT overwrite results
+    # Use a gridified binary mask for filtering; do not overwrite source masks.
     try:
-        # derive binary source for each image (prefer explicit mask*_bin, fallback to thresholded soft mask)
-        if 'mask0_bin' in results and results.get('mask0_bin') is not None:
-            bin0 = results['mask0_bin']
-        elif 'mask0' in results and results.get('mask0') is not None:
-            m0t = results['mask0']
-            bin0 = (m0t > thresh).float() if isinstance(m0t, torch.Tensor) else (np.asarray(m0t) > thresh).astype(np.float32)
-        else:
-            return results
-
-        if 'mask1_bin' in results and results.get('mask1_bin') is not None:
-            bin1 = results['mask1_bin']
-        elif 'mask1' in results and results.get('mask1') is not None:
-            m1t = results['mask1']
-            bin1 = (m1t > thresh).float() if isinstance(m1t, torch.Tensor) else (np.asarray(m1t) > thresh).astype(np.float32)
-        else:
+        bin0 = _get_mask_source(results, 'mask0_bin', 'mask0')
+        bin1 = _get_mask_source(results, 'mask1_bin', 'mask1')
+        if bin0 is None or bin1 is None:
             return results
 
         # gridify (local copy)
@@ -812,17 +837,6 @@ def mask_filter_and_reweight(results, thresh=0.5, dilate=1, grid_win: int = 16):
             mask1 = _to_numpy_mask(results['mask1'])
         else:
             mask1 = np.ones((1, 1), dtype=np.float32)
-
-    # Matching.forward may store boolean in torch tensor or list
-    prefiltered_flag = False
-    if 'mask_prefiltered' in results:
-        flag = results['mask_prefiltered']
-        if isinstance(flag, (list, tuple)):
-            flag = flag[0]
-        if isinstance(flag, torch.Tensor):
-            prefiltered_flag = bool(flag.detach().cpu().item())
-        else:
-            prefiltered_flag = bool(flag)
 
     # fetch points and indices (need idx to decide keep-array length)
     if 'index0' not in results or 'index1' not in results:
@@ -870,6 +884,275 @@ def mask_filter_and_reweight(results, thresh=0.5, dilate=1, grid_win: int = 16):
     results['mconf'] = np.asarray(mconf, dtype=np.float32)[keep]
     results['conf'] = results['mconf']
     return results
+
+
+def main(
+        config,
+        input_dir,
+        input_pairs,
+        output_path,
+        with_desc=False,
+        resize=(-1,),
+        viz=False,
+        save=False,
+        evaluate=False,
+        warp_origin=True,
+        mask_filter=False,
+        mask_filter_thresh=0.5,
+        mask_filter_dilate=2,
+        viz_grid_win=VIZ_GRID_WIN,
+        viz_box_mask_constraint=False,
+        viz_box_mask_thresh=0.5,
+):
+    """Run matching pipeline, optional visualization/save, and optional online pose evaluation."""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    os.makedirs(output_path, exist_ok=True)
+
+    align = ''
+    try:
+        ext_out = str(config['extractor'].get('output', ''))
+        ext_name = str(config['extractor']['model'].get('name', ''))
+        m_name = str(config['matcher']['model'].get('name', ''))
+        if 'disk' in ext_out or 'disk' in ext_name:
+            align = 'disk'
+        elif 'loftr' in m_name:
+            align = 'loftr'
+    except Exception:
+        pass
+
+    gray = bool(config.get('extractor', {}).get('preprocessing', {}).get('grayscale', False))
+
+    model = Matching(config).eval().to(device)
+
+    with open(input_pairs, 'r') as f:
+        pairs = [line.strip().split() for line in f.readlines() if line.strip()]
+
+    if len(pairs) == 0:
+        print(f'No pairs found in: {input_pairs}')
+        return
+
+    scene_infos = defaultdict(dict)
+    eval_pose_errors = defaultdict(list)
+
+    for i, pair in tqdm(enumerate(pairs), total=len(pairs)):
+        if len(pair) < 2:
+            continue
+        name0, name1 = pair[0], pair[1]
+
+        try:
+            if config.get('overlaper') is not None:
+                results = preprocess_overlap_pipeline(
+                    input_dir,
+                    name0,
+                    name1,
+                    device,
+                    resize,
+                    True,
+                    gray,
+                    align,
+                    config,
+                    pair,
+                    model,
+                    with_desc=with_desc,
+                    warp_origin=warp_origin,
+                )
+            else:
+                results = preprocess_match_pipeline(
+                    input_dir,
+                    name0,
+                    name1,
+                    device,
+                    resize,
+                    True,
+                    gray,
+                    align,
+                    config,
+                    pair,
+                    model,
+                    with_desc=with_desc,
+                )
+        except Exception as e:
+            print(f'Pair failed: {name0} {name1} -> {e}')
+            continue
+
+        if mask_filter:
+            try:
+                results = mask_filter_and_reweight(
+                    results,
+                    thresh=float(mask_filter_thresh),
+                    dilate=int(mask_filter_dilate),
+                    grid_win=int(viz_grid_win),
+                )
+            except Exception as e:
+                print(f'mask_filter failed for {name0}, {name1}: {e}')
+
+        if viz or viz_box_mask_constraint:
+            try:
+                _ensure_viz_masks(
+                    results,
+                    bin_thresh=float(mask_filter_thresh),
+                    extractor_name=config['extractor']['model']['name'],
+                )
+            except Exception:
+                pass
+
+        if viz:
+            try:
+                viz_dir = os.path.join(output_path, 'viz')
+                os.makedirs(viz_dir, exist_ok=True)
+                # Main image overlays should use soft masks (not gridified).
+                m0_viz = _to_numpy_mask(results.get('mask0', results.get('mask0_bin', None)))
+                m1_viz = _to_numpy_mask(results.get('mask1', results.get('mask1_bin', None)))
+
+                # Co-visible magenta masks should be gridified.
+                cm0_viz = _gridified_mask(
+                    results.get('crop_mask0', None),
+                    thresh=float(mask_filter_thresh),
+                    win=int(viz_grid_win),
+                )
+                cm1_viz = _gridified_mask(
+                    results.get('crop_mask1', None),
+                    thresh=float(mask_filter_thresh),
+                    win=int(viz_grid_win),
+                )
+
+                # Magenta co-visible overlays should also be gridified.
+                cov0_viz = _gridified_numpy_mask(
+                    results.get('mask0_o', None),
+                    thresh=float(mask_filter_thresh),
+                    win=int(viz_grid_win),
+                )
+                cov1_viz = _gridified_numpy_mask(
+                    results.get('mask1_o', None),
+                    thresh=float(mask_filter_thresh),
+                    win=int(viz_grid_win),
+                )
+                viz_pairs(
+                    viz_dir + '/',
+                    results.get('image0'),
+                    results.get('image1'),
+                    name0,
+                    name1,
+                    results.get('mconf', results.get('conf', np.array([]))),
+                    results.get('kpts0_ori', results.get('kpts0', np.empty((0, 2), dtype=np.float32))),
+                    results.get('kpts1_ori', results.get('kpts1', np.empty((0, 2), dtype=np.float32))),
+                    results.get('mkpts0', np.empty((0, 2), dtype=np.float32)),
+                    results.get('mkpts1', np.empty((0, 2), dtype=np.float32)),
+                    bbox0=results.get('bbox0', None),
+                    bbox1=results.get('bbox1', None),
+                    mask0=m0_viz,
+                    mask1=m1_viz,
+                    crop_mask0=cm0_viz,
+                    crop_mask1=cm1_viz,
+                    match_keep=results.get('mask_postfilter_keep', None),
+                    mask0_o=cov0_viz,
+                    mask1_o=cov1_viz,
+                )
+            except Exception as e:
+                print(f'viz failed for {name0}, {name1}: {e}')
+
+        if viz_box_mask_constraint:
+            try:
+                vis_dir = os.path.join(output_path, 'viz_box_mask_constraint')
+                os.makedirs(vis_dir, exist_ok=True)
+                stem0 = os.path.splitext(os.path.basename(name0))[0]
+                stem1 = os.path.splitext(os.path.basename(name1))[0]
+                vis_path = os.path.join(vis_dir, f'{stem0}_{stem1}_{i:06d}.png')
+                # Keep constraint visualization consistent with gridified mask style.
+                m0_src = _get_mask_source(results, 'mask0_bin', 'mask0')
+                m1_src = _get_mask_source(results, 'mask1_bin', 'mask1')
+                m0_vis = _gridified_mask(m0_src, thresh=float(viz_box_mask_thresh), win=int(viz_grid_win))
+                m1_vis = _gridified_mask(m1_src, thresh=float(viz_box_mask_thresh), win=int(viz_grid_win))
+                visualize_box_mask_constraint_pair(
+                    results.get('image0'),
+                    results.get('image1'),
+                    results.get('bbox0', None),
+                    results.get('bbox1', None),
+                    m0_vis,
+                    m1_vis,
+                    vis_path,
+                    thresh=float(viz_box_mask_thresh),
+                )
+            except Exception as e:
+                print(f'viz_box_mask_constraint failed for {name0}, {name1}: {e}')
+
+        # Group by scene for compatibility with scripts/eval_pose_estimation.py.
+        try:
+            p = Path(name0)
+            scene = p.parts[-3] if len(p.parts) >= 3 else p.parts[0]
+        except Exception:
+            scene = 'default'
+
+        pair_key = f"{Path(name0).stem}-{Path(name1).stem}-{i:06d}"
+        out = {
+            'name0': name0,
+            'name1': name1,
+            'kpts0': np.asarray(results.get('kpts0', np.empty((0, 2), dtype=np.float32))),
+            'kpts1': np.asarray(results.get('kpts1', np.empty((0, 2), dtype=np.float32))),
+            'kpts0_ori': np.asarray(results.get('kpts0_ori', np.empty((0, 2), dtype=np.float32))),
+            'kpts1_ori': np.asarray(results.get('kpts1_ori', np.empty((0, 2), dtype=np.float32))),
+            'mkpts0': np.asarray(results.get('mkpts0', np.empty((0, 2), dtype=np.float32))),
+            'mkpts1': np.asarray(results.get('mkpts1', np.empty((0, 2), dtype=np.float32))),
+            'index0': np.asarray(results.get('index0', np.array([], dtype=np.int32))),
+            'index1': np.asarray(results.get('index1', np.array([], dtype=np.int32))),
+            'conf': np.asarray(results.get('mconf', results.get('conf', np.array([], dtype=np.float32)))),
+            'K0': np.asarray(results.get('K0', np.eye(3))),
+            'K1': np.asarray(results.get('K1', np.eye(3))),
+            'T_0to1': np.asarray(results.get('T_0to1', np.eye(4))),
+            'bbox0': np.asarray(results.get('bbox0', np.array([0, 0, 0, 0]))),
+            'bbox1': np.asarray(results.get('bbox1', np.array([0, 0, 0, 0]))),
+            'mask0': _to_numpy_mask(results.get('mask0', None)),
+            'mask1': _to_numpy_mask(results.get('mask1', None)),
+            'mask0_o': _to_numpy_mask(results.get('mask0_o', None)),
+            'mask1_o': _to_numpy_mask(results.get('mask1_o', None)),
+            'overlap_time': results.get('overlap_time', None),
+        }
+        scene_infos[scene][pair_key] = out
+
+        if evaluate:
+            try:
+                from scripts.valid_utils import compute_pose_error, estimate_pose, pose_auc
+
+                mk0 = out['mkpts0']
+                mk1 = out['mkpts1']
+                if mk0.shape[0] >= 5 and mk1.shape[0] >= 5:
+                    ret = estimate_pose(mk0, mk1, out['K0'], out['K1'], ransac=True, thresh=1.0)
+                    if ret is None:
+                        pose_err = np.inf
+                    else:
+                        R, t, _ = ret
+                        err_t, err_r = compute_pose_error(out['T_0to1'], R, t)
+                        pose_err = max(float(err_t), float(err_r))
+                    eval_pose_errors[scene].append(pose_err)
+            except Exception:
+                pass
+
+    # Save scene-wise infos.npz if requested.
+    if save:
+        for scene, infos in scene_infos.items():
+            scene_dir = os.path.join(output_path, scene)
+            os.makedirs(scene_dir, exist_ok=True)
+            np.savez(
+                os.path.join(scene_dir, 'infos.npz'),
+                **{k: np.array(v, dtype=object) for k, v in infos.items()},
+            )
+        print(f'Saved results to: {output_path}')
+
+    # Optional online pose summary.
+    if evaluate:
+        try:
+            from scripts.valid_utils import pose_auc
+            for scene, errs in eval_pose_errors.items():
+                if len(errs) == 0:
+                    continue
+                auc5, auc10, auc20 = [100.0 * x for x in pose_auc(errs, [5, 10, 20])]
+                print(f'[{scene}] AUC@5/10/20: {auc5:.2f}/{auc10:.2f}/{auc20:.2f}')
+            all_errs = [e for arr in eval_pose_errors.values() for e in arr]
+            if len(all_errs) > 0:
+                auc5, auc10, auc20 = [100.0 * x for x in pose_auc(all_errs, [5, 10, 20])]
+                print(f'[ALL] AUC@5/10/20: {auc5:.2f}/{auc10:.2f}/{auc20:.2f}')
+        except Exception as e:
+            print(f'Online evaluation skipped: {e}')
 
 
 if __name__ == '__main__':
@@ -934,7 +1217,7 @@ if __name__ == '__main__':
         '--warp_origin', action='store_false',
         help='Warp keypoints to original image scale'
     )
-    # --- New CLI flags for mask-guided filtering ---
+    # CLI flags for mask-guided filtering.
     parser.add_argument(
         '--mask_filter', action='store_true',
         help='Filter matches by predicted masks at original scale'
@@ -947,6 +1230,10 @@ if __name__ == '__main__':
         '--mask_filter_dilate', type=int, default=2,
         help='Local window radius for mask lookup'
     )
+    parser.add_argument(
+        '--viz_grid_win', type=int, default=VIZ_GRID_WIN,
+        help='Grid window size for visualization-related mask gridification'
+    )
 
     parser.add_argument(
         '--viz_box_mask_constraint', action='store_true',
@@ -956,12 +1243,6 @@ if __name__ == '__main__':
         '--viz_box_mask_thresh', type=float, default=0.5,
         help='Threshold used for mask rendering inside bbox'
     )
-
-    # Removed CLI args not used by release shell workflow:
-    # --mask_reweight
-    # --debug_viz
-    # --debug_viz_every
-    # --debug_viz_max_matches
 
     opt = parser.parse_args()
     
@@ -995,6 +1276,7 @@ if __name__ == '__main__':
         mask_filter=opt.mask_filter,
         mask_filter_thresh=opt.mask_filter_thresh,
         mask_filter_dilate=opt.mask_filter_dilate,
+        viz_grid_win=opt.viz_grid_win,
         viz_box_mask_constraint=opt.viz_box_mask_constraint,
         viz_box_mask_thresh=opt.viz_box_mask_thresh,
     )
