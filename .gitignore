@@ -6,6 +6,8 @@ dist/
 wheels/
 *.egg-info
 nohup.out
+*.log
+*.csv
 
 # Virtual environments
 .venv
